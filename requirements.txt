@@ -1,0 +1,16 @@
+# Core
+fastapi>=0.115
+uvicorn[standard]>=0.30
+pymongo[srv]>=4.13
+pydantic>=2.9
+pydantic-settings>=2.6
+argon2-cffi>=23.1
+PyJWT>=2.9
+python-multipart>=0.0.9
+
+# Vision / OCR
+tensorflow>=2.16
+pillow>=10.0
+numpy>=1.26
+opencv-python-headless>=4.9
+pytesseract>=3.10
