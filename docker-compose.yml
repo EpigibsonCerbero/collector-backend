@@ -1,0 +1,22 @@
+services:
+  mongo:
+    image: mongo:7
+    # Single-node replica set: lets us use multi-document transactions
+    # (garage add + wishlist auto-remove) if we need them later.
+    command: ["mongod", "--replSet", "rs0", "--bind_ip_all", "--port", "27018"]
+    ports:
+      - "27018:27018"
+    volumes:
+      - collector_mongo_data:/data/db
+    healthcheck:
+      test: >
+        mongosh --quiet --port 27018 --eval "
+          try { rs.status().ok } catch(e) {
+            rs.initiate({_id:'rs0', members:[{_id:0, host:'localhost:27018'}]}); 1
+          }"
+      interval: 5s
+      timeout: 10s
+      retries: 12
+
+volumes:
+  collector_mongo_data:

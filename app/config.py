@@ -1,0 +1,33 @@
+from functools import lru_cache
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    app_name: str = "collector-manager-api"
+    env: str = "dev"
+
+    # MongoDB (puerto 27018: el 27017 ya lo usa finance-mongo-1)
+    mongo_url: str = "mongodb://localhost:27018/?replicaSet=rs0"
+    mongo_db: str = "collector_manager"
+
+    # JWT
+    jwt_secret: str = "dev-only-secret-change-me-32bytes-min!!"
+    jwt_alg: str = "HS256"
+    access_ttl_min: int = 60
+    refresh_ttl_days: int = 30
+
+    # Bootstrap admin (dev)
+    seed_admin_email: str = "admin@collector.local"
+    seed_admin_password: str = "AdminDev123!"
+    seed_admin_username: str = "admin"
+
+    # Seed del catálogo Mini GT scrapeado
+    catalog_seed_path: str = "../data/minigt-catalog.json"
+
+
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()
