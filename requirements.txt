@@ -13,4 +13,4 @@ tensorflow>=2.16
 pillow>=10.0
 numpy>=1.26
 opencv-python-headless>=4.9
-pytesseract>=3.10
+pytesseract>=0.3.10
