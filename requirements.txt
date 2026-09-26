@@ -14,3 +14,4 @@ pillow>=10.0
 numpy>=1.26
 opencv-python-headless>=4.9
 pytesseract>=0.3.10
+mangum>=0.17

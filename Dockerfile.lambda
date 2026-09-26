@@ -1,0 +1,21 @@
+# AWS Lambda container image — FastAPI + TensorFlow + Tesseract
+FROM public.ecr.aws/lambda/python:3.12
+
+# Tesseract + idiomas + OpenCV deps
+RUN yum update -y && yum install -y \
+    tesseract \
+    tesseract-eng \
+    tesseract-spa \
+    mesa-libGL \
+    mesa-libGLU \
+    && yum clean all
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copiar app completa
+COPY app/ ${LAMBDA_TASK_ROOT}/app/
+COPY lambda_handler.py ${LAMBDA_TASK_ROOT}/
+
+# Handler de Lambda
+CMD ["lambda_handler.handler"]
