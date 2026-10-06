@@ -8,4 +8,5 @@ from mangum import Mangum
 from app.main import app
 
 # lifespan="auto" → ejecuta startup/shutdown events (warmup de modelo)
-handler = Mangum(app, lifespan="auto", api_gateway_base_path="/api/v1")
+# Sin api_gateway_base_path: las rutas FastAPI ya incluyen /api/v1
+handler = Mangum(app, lifespan="auto")

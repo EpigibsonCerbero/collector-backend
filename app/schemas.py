@@ -157,12 +157,13 @@ class CatalogItemOut(BaseModel):
     name: str
     manufacturer: str
     release_year: int
-    category_id: Optional[str] = None
-    brand_id: Optional[str] = None
-    series_id: Optional[str] = None
+    # category_id puede ser int (seed MiniGT puso 1) o str — aceptar ambos
+    category_id: Optional[str | int] = None
+    brand_id: Optional[str | int] = None
+    series_id: Optional[str | int] = None
     casting_name: Optional[str] = None
     designer: Optional[str] = None
-    scale: str = "1:64"
+    scale: Optional[str] = "1:64"
 
 
 class ItemVariantOut(BaseModel):
@@ -171,6 +172,16 @@ class ItemVariantOut(BaseModel):
     variant_name: str
     sku_upc: Optional[str] = None
     main_image_url: Optional[str] = None
+    # Vistas adicionales del packshot del catálogo (el scrape trae hasta 6).
+    # La ficha de la app las muestra como galería; `main_image_url` sigue
+    # siendo la foto principal (la oficial del catálogo).
+    images: list[str] = Field(default_factory=list)
+    # Livery semántico (curado con visión): descripción del diseño + color y
+    # dorsal declarados. Lo usa el identify para desampatar gemelos y la app
+    # para mostrar "qué lo hace distinto".
+    livery_desc: Optional[str] = None
+    livery_color: Optional[str] = None
+    livery_number: Optional[str] = None
     ai_local_hash: str
     metadata: dict[str, Any] = Field(default_factory=dict)
     toy_number: Optional[str] = None

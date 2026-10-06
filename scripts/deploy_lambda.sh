@@ -131,16 +131,26 @@ aws lambda add-permission \
 API_URL="https://$API_ID.execute-api.$REGION.amazonaws.com"
 echo "  ✅ API Gateway: $API_URL"
 
+# Secretos: SIEMPRE desde backend/.env (gitignored), nunca escritos en el script.
+# (2026-10-06: la URL de Mongo y el JWT_SECRET estaban en claro y llegaron a GitHub.)
+set -a
+[ -f "$(dirname "$0")/../.env" ] && . "$(dirname "$0")/../.env"
+set +a
+: "${MONGO_URL:?falta MONGO_URL en backend/.env}"
+: "${JWT_SECRET:?falta JWT_SECRET en backend/.env}"
+GEMINI_API_KEY="${GEMINI_API_KEY:-}"
+
 # ── 5. Environment variables ────────────────────────────────────────────────
 echo ""
 echo "▶ [5/5] Variables de entorno..."
 aws lambda update-function-configuration \
   --function-name $LAMBDA_NAME \
   --environment "Variables={
-    MONGO_URL=mongodb+srv://cl0udd4t4dev_db_user:TxreXwqygHJWVevw@collector.x0qoxf3.mongodb.net/?appName=collector,
+    MONGO_URL=${MONGO_URL},
     MONGO_DB=collector_manager,
-    JWT_SECRET=prod-secret-change-me-32bytes-minimum!!,
-    ENV=prod
+    JWT_SECRET=${JWT_SECRET},
+    ENV=prod,
+    GEMINI_API_KEY=${GEMINI_API_KEY}
   }" \
   --region $REGION > /dev/null
 echo "  ✅ Variables configuradas"

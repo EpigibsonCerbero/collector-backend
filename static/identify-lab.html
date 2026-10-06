@@ -1,0 +1,819 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Identify Lab · CollectorManager</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+<style>
+  :root{
+    --bg:#0A0B0F; --bg2:#12141A; --bg3:#1A1D25;
+    --line:#2A2E38; --line2:#3A3F4B;
+    --txt:#F2F0EC; --txt2:#A63A3A; --muted:#8A8F9A;
+    --red:#E10600; --red2:#FF2A1F; --gold:#D4AF37;
+    --ok:#22C55E; --warn:#F59E0B; --bad:#EF4444;
+  }
+  *{box-sizing:border-box; margin:0; padding:0}
+  html,body{background:var(--bg); color:var(--txt); font-family:"Inter",-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; -webkit-font-smoothing:antialiased}
+  .wrap{max-width:1280px; margin:0 auto; padding:28px 22px 80px}
+
+  /* ── Header ── */
+  header{display:flex; align-items:center; justify-content:space-between; gap:16px; padding-bottom:22px; border-bottom:1px solid var(--line); margin-bottom:26px}
+  .brand{display:flex; align-items:center; gap:13px}
+  .mark{width:38px; height:38px; border-radius:10px; background:linear-gradient(135deg,var(--red),#7A0300); display:grid; place-items:center; font-weight:800; font-size:17px; letter-spacing:.5px; color:#fff}
+  h1{font-size:19px; font-weight:650; letter-spacing:-.3px}
+  .sub{font-size:11.5px; color:var(--muted); letter-spacing:1.4px; text-transform:uppercase; margin-top:2px}
+  .badge{font-size:11px; color:var(--muted); border:1px solid var(--line); padding:6px 11px; border-radius:999px; letter-spacing:.4px}
+
+  /* ── Dropzone ── */
+  .drop{border:1.5px dashed var(--line2); border-radius:16px; padding:34px 20px; text-align:center; cursor:pointer; transition:.18s; background:var(--bg2)}
+  .drop:hover,.drop.over{border-color:var(--red); background:#160F10}
+  .drop .big{font-size:15px; font-weight:550; margin-bottom:6px}
+  .drop .small{font-size:12.5px; color:var(--muted)}
+  .drop input{display:none}
+
+  /* ── Actions ── */
+  .actions{display:flex; gap:11px; margin:18px 0 26px; flex-wrap:wrap}
+  button{font-family:inherit; cursor:pointer; border:0; border-radius:11px; font-size:13.5px; font-weight:600; letter-spacing:.2px; padding:12px 20px; transition:.16s; display:inline-flex; align-items:center; gap:8px}
+  .btn-red{background:var(--red); color:#fff}
+  .btn-red:hover{background:var(--red2)}
+  .btn-red:disabled{opacity:.45; cursor:not-allowed}
+  .btn-ghost{background:transparent; color:var(--txt); border:1px solid var(--line2)}
+  .btn-ghost:hover{border-color:var(--red); color:#fff}
+  .btn-ghost:disabled{opacity:.4; cursor:not-allowed}
+
+  /* ── Compare card (capturable) ── */
+  #capture{background:var(--bg2); border:1px solid var(--line); border-radius:18px; padding:22px; margin-bottom:22px}
+  .cap-head{display:flex; align-items:center; justify-content:space-between; margin-bottom:16px; padding-bottom:13px; border-bottom:1px solid var(--line)}
+  .cap-title{font-size:13px; letter-spacing:2.2px; text-transform:uppercase; color:var(--muted); font-weight:600}
+  .cap-meta{display:flex; gap:8px; flex-wrap:wrap}
+  .pill{font-size:11px; padding:5px 11px; border-radius:999px; font-weight:650; letter-spacing:.3px}
+  .pill.method{background:rgba(225,6,0,.15); color:var(--red2); border:1px solid rgba(225,6,0,.35)}
+  .pill.conf{background:rgba(212,175,55,.12); color:var(--gold); border:1px solid rgba(212,175,55,.32)}
+  .pill.time{background:rgba(255,255,255,.05); color:var(--muted); border:1px solid var(--line)}
+  .pill.ok{background:rgba(34,197,94,.12); color:var(--ok); border:1px solid rgba(34,197,94,.3)}
+  .pill.warn{background:rgba(245,158,11,.12); color:var(--warn); border:1px solid rgba(245,158,11,.3)}
+
+  .grid2{display:grid; grid-template-columns:1fr 1fr; gap:18px}
+  .panel{background:var(--bg3); border:1px solid var(--line); border-radius:14px; overflow:hidden}
+  .panel .lbl{padding:12px 15px; font-size:11.5px; letter-spacing:2px; text-transform:uppercase; color:var(--muted); font-weight:650; border-bottom:1px solid var(--line); display:flex; align-items:center; gap:8px}
+  .panel .lbl .dot{width:7px; height:7px; border-radius:50%}
+  .panel.left .lbl .dot{background:var(--gold)}
+  .panel.right .lbl .dot{background:var(--red)}
+  .panel .imgbox{aspect-ratio:1/1; background:#0D0F14; display:grid; place-items:center; position:relative; overflow:hidden}
+  .panel .imgbox img{width:100%; height:100%; object-fit:contain; display:block}
+  .panel .imgbox .empty{color:#4A4F5A; font-size:12.5px; letter-spacing:.6px}
+  .panel .foot{padding:11px 15px; border-top:1px solid var(--line); font-size:12px; color:var(--muted); min-height:42px; display:flex; align-items:center; gap:8px; flex-wrap:wrap}
+  .panel .foot .name{color:var(--txt); font-weight:600; font-size:12.5px}
+
+  .names{margin-top:18px; display:grid; grid-template-columns:1fr 1fr; gap:18px}
+  .names .cell{background:var(--bg3); border:1px solid var(--line); border-radius:12px; padding:13px 15px}
+  .names .k{font-size:10.5px; letter-spacing:1.8px; text-transform:uppercase; color:var(--muted); margin-bottom:5px}
+  .names .v{font-size:14px; font-weight:600; line-height:1.35}
+
+  /* ── Detail + JSON ── */
+  .cols{display:grid; grid-template-columns:1.05fr .95fr; gap:18px}
+  .card{background:var(--bg2); border:1px solid var(--line); border-radius:16px; padding:18px}
+  .card h2{font-size:12px; letter-spacing:2px; text-transform:uppercase; color:var(--muted); font-weight:650; margin-bottom:14px; display:flex; align-items:center; justify-content:space-between}
+  .kv{display:grid; grid-template-columns:118px 1fr; gap:7px 12px; font-size:12.8px}
+  .kv .k{color:var(--muted)}
+  .kv .v{color:var(--txt); font-weight:550; word-break:break-word}
+  .kv .v.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:11.5px}
+
+  .sugg{display:flex; flex-direction:column; gap:8px}
+  .sugg .row{display:flex; align-items:center; gap:11px; background:var(--bg3); border:1px solid var(--line); border-radius:10px; padding:9px 12px}
+  .sugg .rank{width:22px; height:22px; border-radius:6px; background:rgba(225,6,0,.14); color:var(--red2); font-size:11px; font-weight:700; display:grid; place-items:center; flex-shrink:0}
+  .sugg .nm{flex:1; font-size:12.3px; font-weight:550; line-height:1.3}
+  .sugg .sc{font-family:ui-monospace,Menlo,monospace; font-size:11.5px; color:var(--gold); font-weight:650}
+  .sugg .bar{height:3px; border-radius:99px; background:rgba(225,6,0,.55); margin-top:5px}
+
+  pre#json{background:#0C0E13; border:1px solid var(--line); border-radius:12px; padding:15px; overflow:auto; max-height:520px; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:11px; line-height:1.55; color:#C8CDD6; white-space:pre-wrap; word-break:break-word}
+
+  .timings{display:flex; flex-direction:column; gap:7px; margin-top:4px}
+  .timings .t{display:grid; grid-template-columns:86px 1fr 62px; gap:10px; align-items:center; font-size:11.5px}
+  .timings .t .lbl{color:var(--muted); text-transform:uppercase; letter-spacing:1px; font-size:10px}
+  .timings .t .track{height:6px; background:var(--bg3); border-radius:99px; overflow:hidden}
+  .timings .t .fill{height:100%; background:linear-gradient(90deg,var(--red),var(--red2)); border-radius:99px}
+  .timings .t .ms{font-family:ui-monospace,Menlo,monospace; color:var(--txt); text-align:right}
+
+  .ocr{background:#0C0E13; border:1px solid var(--line); border-radius:10px; padding:12px 13px; font-family:ui-monospace,Menlo,monospace; font-size:11px; line-height:1.6; color:#B8BFC9; white-space:pre-wrap; max-height:150px; overflow:auto}
+
+  .status{font-size:12.5px; padding:11px 14px; border-radius:11px; margin-bottom:16px; display:none; border:1px solid}
+  .status.show{display:block}
+  .status.run{background:rgba(225,6,0,.08); border-color:rgba(225,6,0,.28); color:#FFB3AE}
+  .status.err{background:rgba(239,68,68,.1); border-color:rgba(239,68,68,.32); color:#FCA5A5}
+  .status.ok{background:rgba(34,197,94,.09); border-color:rgba(34,197,94,.28); color:#86EFAC}
+
+  /* ── Debug en vivo ── */
+  .debug-card{background:var(--bg2); border:1px solid var(--line); border-radius:16px; padding:18px; margin:22px 0}
+  .debug-head{display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:13px; flex-wrap:wrap}
+  .debug-head h2{font-size:12px; letter-spacing:2px; text-transform:uppercase; color:var(--muted); font-weight:650; margin:0; display:flex; align-items:center; gap:9px}
+  .live-dot{width:8px; height:8px; border-radius:50%; background:var(--bad); animation:pulse 1.6s infinite}
+  .live-dot.on{background:var(--ok)}
+  .live-dot.wait{background:var(--warn)}
+  @keyframes pulse{0%{opacity:1}50%{opacity:.35}100%{opacity:1}}
+  .debug-actions{display:flex; gap:8px; flex-wrap:wrap}
+  .btn-mini{font-family:inherit; cursor:pointer; border:1px solid var(--line2); background:transparent; color:var(--txt); border-radius:8px; font-size:11px; font-weight:600; padding:7px 12px; transition:.15s; letter-spacing:.3px}
+  .btn-mini:hover{border-color:var(--red); color:#fff}
+  #debug-log{background:#08090C; border:1px solid var(--line); border-radius:12px; padding:12px 13px; height:340px; overflow:auto; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:11px; line-height:1.65}
+  #debug-log .ln{display:flex; gap:9px; padding:1px 0; white-space:pre-wrap; word-break:break-word}
+  #debug-log .ts{color:#4A4F5A; flex-shrink:0}
+  #debug-log .stg{flex-shrink:0; font-weight:700; min-width:82px; text-transform:uppercase; font-size:9.5px; letter-spacing:.6px; padding-top:2px}
+  #debug-log .msg{color:#C2C8D2; flex:1}
+  #debug-log .msg.err{color:#FCA5A5}
+  #debug-log .stg.client{color:#7DD3FC}
+  #debug-log .stg.petición,#debug-log .stg.pipeline,#debug-log .stg.imagen{color:#93C5FD}
+  #debug-log .stg.barcode,#debug-log .stg.embed,#debug-log .stg.ocr,#debug-log .stg.yolo{color:#C4B5FD}
+  #debug-log .stg.match,#debug-log .stg.texto,#debug-log .stg.marca,#debug-log .stg.multicrop{color:#FCD34D}
+  #debug-log .stg.color{color:#F0ABFC}
+  #debug-log .stg.dorsal{color:#FDBA74}
+  #debug-log .stg.mongo{color:#6EE7B7}
+  #debug-log .stg.decisión,#debug-log .stg.resultado{color:#FCA5A5}
+  #debug-log .stg.error{color:#F87171}
+  .debug-foot{margin-top:9px; font-size:11px; color:var(--muted); display:flex; justify-content:space-between; gap:12px; flex-wrap:wrap}
+
+  /* ── Consejos de foto ── */
+  .tips{margin:16px 0 4px; background:var(--bg2); border:1px solid var(--line); border-radius:14px; overflow:hidden}
+  .tips-head{width:100%; display:flex; align-items:center; gap:10px; padding:14px 16px; background:transparent; border:0; cursor:pointer; color:var(--txt); font-family:inherit; text-align:left}
+  .tips-head .ic{width:26px; height:26px; border-radius:8px; background:rgba(212,175,55,.14); color:#D4AF37; display:grid; place-items:center; flex-shrink:0}
+  .tips-head .t{flex:1}
+  .tips-head .t b{display:block; font-size:12px; letter-spacing:1.4px; text-transform:uppercase; font-weight:650}
+  .tips-head .t span{display:block; font-size:11px; color:var(--muted); margin-top:2px}
+  .tips-head .chev{color:var(--muted); transition:transform .2s}
+  .tips.open .tips-head .chev{transform:rotate(180deg)}
+  .tips-body{display:none; padding:0 16px 16px; border-top:1px solid var(--line)}
+  .tips.open .tips-body{display:block}
+  .tips-grid{display:grid; grid-template-columns:repeat(auto-fill,minmax(230px,1fr)); gap:9px; margin-top:14px}
+  .tip{display:flex; gap:10px; align-items:flex-start; background:var(--bg3); border:1px solid var(--line); border-radius:10px; padding:11px 12px}
+  .tip .n{width:19px; height:19px; border-radius:6px; background:rgba(225,6,0,.14); color:#FF2A1A; font-size:10px; font-weight:700; display:grid; place-items:center; flex-shrink:0}
+  .tip .c b{display:block; font-size:11.5px; font-weight:600; margin-bottom:2px}
+  .tip .c span{display:block; font-size:10.5px; color:var(--muted); line-height:1.45}
+
+  /* ejemplos fotográficos */
+  .ex-title{margin:18px 0 10px; font-size:11px; letter-spacing:2px; text-transform:uppercase; font-weight:650; color:var(--muted); display:flex; align-items:center; gap:8px}
+  .ex-title::after{content:""; flex:1; height:1px; background:var(--line)}
+  .ex-grid{display:grid; grid-template-columns:repeat(auto-fill,minmax(210px,1fr)); gap:12px}
+  .ex{background:var(--bg3); border:1px solid var(--line); border-radius:12px; overflow:hidden}
+  .ex .ph{position:relative; aspect-ratio:4/3; background:#0D0F14}
+  .ex .ph img{width:100%; height:100%; object-fit:cover; display:block}
+  .ex .flag{position:absolute; top:8px; left:8px; font-size:10px; font-weight:700; letter-spacing:.6px; padding:4px 9px; border-radius:999px}
+  .ex.good .flag{background:rgba(34,197,94,.92); color:#04140A}
+  .ex.bad  .flag{background:rgba(239,68,68,.92); color:#1C0505}
+  .ex .cap{padding:10px 11px}
+  .ex .cap b{display:block; font-size:11.5px; font-weight:650; margin-bottom:3px}
+  .ex .cap span{display:block; font-size:10.5px; color:var(--muted); line-height:1.5}
+
+  /* selector de marca */
+  .brandbar{display:flex; align-items:center; gap:10px; margin:14px 0 2px; flex-wrap:wrap}
+  .brandbar label{font-size:11px; letter-spacing:1.6px; text-transform:uppercase; color:var(--muted); font-weight:600}
+  .brandbar select{font-family:inherit; background:var(--bg2); color:var(--txt); border:1px solid var(--line2); border-radius:10px; padding:10px 13px; font-size:13px; min-width:200px; cursor:pointer}
+  .brandbar select:focus{outline:none; border-color:var(--red)}
+  .brandbar .hint{font-size:11px; color:var(--muted); flex:1; min-width:180px}
+
+  .empty-state{color:#4A4F5A; text-align:center; padding:30px 16px; font-size:12.5px; letter-spacing:.4px}
+
+  @media (max-width:900px){
+    .grid2,.cols,.names{grid-template-columns:1fr}
+    .wrap{padding:18px 13px 60px}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <div class="brand">
+      <div class="mark">CM</div>
+      <div>
+        <h1>Identify Lab</h1>
+        <div class="sub">Banco de pruebas · visión · CollectorManager</div>
+      </div>
+    </div>
+    <div class="badge" id="endpoint-badge">POST /api/v1/identify</div>
+  </header>
+
+  <div class="status" id="status"></div>
+
+  <!-- Drop -->
+  <div class="drop" id="drop">
+    <div class="big">Arrastra una foto aquí o haz clic para elegir</div>
+    <div class="small">JPG / PNG / WEBP · foto real del coche, empaque o blister</div>
+    <input type="file" id="file" accept="image/*" />
+  </div>
+
+  <!-- ══ SELECTOR DE MARCA (opcional) ══ -->
+  <div class="brandbar">
+    <label for="brand">Marca de la pieza</label>
+    <select id="brand">
+      <option value="">No estoy seguro / autodetectar</option>
+      <option value="Mini GT">Mini GT</option>
+      <option value="Mattel">Hot Wheels / Mattel</option>
+      <option value="Tomica">Tomica</option>
+      <option value="Inno64">Inno64</option>
+      <option value="Tarmac Works">Tarmac Works</option>
+      <option value="Kaido House">Kaido House</option>
+      <option value="Pop Race">Pop Race</option>
+    </select>
+    <span class="hint">Opcional. Si la dices, el matching aprieta el prior de marca (+0.20 / ×0.45). Cada marca trae su código: <b>MGT#####</b> y dorsal <b>#NN</b> en Mini GT · <b>UPC/SKU</b> en Hot Wheels · <b>JAN</b> en Tomica.</span>
+  </div>
+
+  <!-- ══ CONSEJOS DE FOTO ══ -->
+  <div class="tips" id="tips">
+    <button class="tips-head" id="tips-toggle" type="button" aria-expanded="false">
+      <span class="ic">★</span>
+      <span class="t">
+        <b>Una foto normal ya vale</b>
+        <span>Con tu móvil y la mesa de casa. Solo hay 3 cosas que de verdad cambian el resultado.</span>
+      </span>
+      <span class="chev">▾</span>
+    </button>
+    <div class="tips-body">
+
+      <div class="ex-title">Lo único que de verdad importa</div>
+      <div class="ex-grid">
+        <div class="ex good">
+          <div class="ph"><span class="flag">✅ 1</span><img src="/lab/tips/bien-pieza-llena.jpg" alt="La pieza ocupa casi todo el encuadre" loading="lazy"></div>
+          <div class="cap"><b>Que el coche llene la foto</b><span>Acércate. No hace falta trípode ni nada: si el coche se ve chiquito, el resultado empeora muchísimo. Este es el consejo que más cambia el resultado.</span></div>
+        </div>
+        <div class="ex good">
+          <div class="ph"><span class="flag">✅ 2</span><img src="/lab/tips/bien-con-empaque.jpg" alt="Con el empaque a la vista" loading="lazy"></div>
+          <div class="cap"><b>Si el empaque está a mano, sácalo</b><span>No hace falta que se vea perfecto. Con que se lea algo (el número de pieza, la marca) ya nos ayuda muchísimo. Si no lo tienes, también vale la pieza sola.</span></div>
+        </div>
+        <div class="ex good">
+          <div class="ph"><span class="flag">✅ 3</span><img src="/lab/tips/bien-angulo-3-4.jpg" alt="Una pieza sola en la foto" loading="lazy"></div>
+          <div class="cap"><b>Una pieza por foto</b><span>Con varias juntas no sabemos cuál quieres. Si tienes varias, una foto de cada una.</span></div>
+        </div>
+      </div>
+
+      <div class="ex-title">Lo que sí lastra (pero no hace falta ir con lupa)</div>
+      <div class="ex-grid">
+        <div class="ex bad">
+          <div class="ph"><span class="flag">✗</span><img src="/lab/tips/mal-varias-piezas.jpg" alt="Varias piezas en la misma foto" loading="lazy"></div>
+          <div class="cap"><b>Varias piezas de golpe</b><span>Aquí sí que falla de verdad: un blister de 3 nos hizo devolver <i>otra marca</i> con toda la confianza.</span></div>
+        </div>
+        <div class="ex bad">
+          <div class="ph"><span class="flag">✗</span><img src="/lab/tips/mal-poca-luz.jpg" alt="Foto con muy poca luz" loading="lazy"></div>
+          <div class="cap"><b>Con muy poca luz</b><span>Una mala luz nos cuesta. No hace falta estudio: enciende la luz de la habitación y ya está.</span></div>
+        </div>
+        <div class="ex bad">
+          <div class="ph"><span class="flag">✗</span><img src="/lab/tips/mal-pantalla.png" alt="Foto a una pantalla" loading="lazy"></div>
+          <div class="cap"><b>Foto a otra pantalla</b><span>Un pantallazo no es la pieza. Aunque sea la foto de internet, súbela directa (no la fotografíes).</span></div>
+        </div>
+      </div>
+
+      <div class="ex-title">Tranqui con esto</div>
+      <div class="tips-grid">
+        <div class="tip"><span class="n">✓</span><div class="c"><b>Mesa, cajas y cosas detrás</b><span>Da igual. La mesa, la caja de otro coche o tu mano: el identificador está preparado para fotos normales.</span></div></div>
+        <div class="tip"><span class="n">✓</span><div class="c"><b>Ángulos raros</b><span>De lado, de arriba o con la mano delante. No hace falta el ángulo perfecto.</span></div></div>
+        <div class="tip"><span class="n">✓</span><div class="c"><b>Que la foto no salga perfecta</b><span>Algo movida o con sombra también sirve. Solo evita la oscuridad total.</span></div></div>
+        <div class="tip"><span class="n">✓</span><div class="c"><b>Marca y escala</b><span>Si la sabes, dila en el selector de arriba. Si no, no pasa nada: la detectamos.</span></div></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="actions">
+    <button class="btn-red" id="btn-run" disabled>▶&nbsp; Identificar</button>
+    <button class="btn-ghost" id="btn-shot" disabled>⤓&nbsp; Generar captura</button>
+    <button class="btn-ghost" id="btn-copy" disabled>⧉&nbsp; Copiar JSON</button>
+    <button class="btn-ghost" id="btn-clear">✕&nbsp; Limpiar</button>
+  </div>
+
+  <!-- ══ DEBUG EN VIVO + CAPTURA (todo junto para el screenshot) ══ -->
+  <div id="shot-area">
+  <!-- ══ DEBUG EN VIVO ══ -->
+  <div class="debug-card" id="capture-debug">
+    <div class="debug-head">
+      <h2><span class="live-dot" id="live-dot"></span> Debug en tiempo real <span id="live-label" style="color:var(--muted); font-weight:500; letter-spacing:.4px; text-transform:none">· conectando…</span></h2>
+      <div class="debug-actions">
+        <button class="btn-mini" id="btn-dbg-copy">⧉ Copiar debug</button>
+        <button class="btn-mini" id="btn-dbg-clear">✕ Limpiar</button>
+        <button class="btn-mini" id="btn-dbg-pause">⏸ Pausar</button>
+      </div>
+    </div>
+    <div id="debug-log"><div class="empty-state">Esperando eventos del pipeline…</div></div>
+    <div class="debug-foot">
+      <span id="dbg-count">0 eventos</span>
+      <span>SSE <code style="color:var(--muted)">/lab/stream</code> · cada etapa del backend llega aquí mientras corre</span>
+    </div>
+  </div>
+
+  <!-- ══ CAPTURA ══ -->
+  <div id="capture">
+    <div class="cap-head">
+      <div class="cap-title">Comparativa de identificación</div>
+      <div class="cap-meta" id="cap-meta">
+        <span class="pill time" id="pill-time">— ms</span>
+      </div>
+    </div>
+
+    <div class="grid2">
+      <div class="panel left">
+        <div class="lbl"><span class="dot"></span> Imagen subida</div>
+        <div class="imgbox" id="box-up">
+          <div class="empty">Sin imagen</div>
+        </div>
+        <div class="foot" id="foot-up">Esperando foto…</div>
+      </div>
+      <div class="panel right">
+        <div class="lbl"><span class="dot"></span> Imagen del catálogo</div>
+        <div class="imgbox" id="box-cat">
+          <div class="empty">Sin resultado</div>
+        </div>
+        <div class="foot" id="foot-cat">Esperando identificación…</div>
+      </div>
+    </div>
+
+    <div class="names">
+      <div class="cell">
+        <div class="k">Resultado identificado</div>
+        <div class="v" id="res-name">—</div>
+      </div>
+      <div class="cell">
+        <div class="k">Toy number · SKU · Marca</div>
+        <div class="v" id="res-toy">—</div>
+      </div>
+    </div>
+  </div>
+  </div><!-- /#shot-area -->
+
+  <!-- ══ DETALLE ══ -->
+  <div class="cols">
+    <div style="display:flex; flex-direction:column; gap:18px">
+      <div class="card">
+        <h2>Decisión</h2>
+        <div class="kv" id="kv-decision">
+          <div class="k">Método</div><div class="v" id="d-method">—</div>
+          <div class="k">Confianza</div><div class="v" id="d-conf">—</div>
+          <div class="k">Manual</div><div class="v" id="d-manual">—</div>
+          <div class="k">UPC</div><div class="v mono" id="d-upc">—</div>
+          <div class="k">Toy number</div><div class="v mono" id="d-toy">—</div>
+          <div class="k">ID pieza</div><div class="v mono" id="d-id">—</div>
+          <div class="k">Color</div><div class="v" id="d-color">—</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Tiempos por etapa</h2>
+        <div class="timings" id="timings"><div class="empty-state">Sin datos</div></div>
+      </div>
+
+      <div class="card">
+        <h2>Sugerencias (top candidatos)</h2>
+        <div class="sugg" id="sugg"><div class="empty-state">Sin datos</div></div>
+      </div>
+
+      <div class="card">
+        <h2>OCR · texto leído</h2>
+        <div class="ocr" id="ocr">—</div>
+      </div>
+    </div>
+
+    <div class="card" style="align-self:start">
+      <h2>Respuesta completa <span style="font-size:10px; letter-spacing:1px; opacity:.6">JSON</span></h2>
+      <pre id="json">{}</pre>
+    </div>
+  </div>
+
+</div>
+
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const drop = $('drop'), fileInput = $('file');
+  const btnRun = $('btn-run'), btnShot = $('btn-shot'), btnCopy = $('btn-copy'), btnClear = $('btn-clear');
+  const statusEl = $('status');
+
+  let currentFile = null;
+  let currentObjectUrl = null;
+  let lastJson = null;
+
+  // ── Status helpers ──
+  function setStatus(kind, msg) {
+    statusEl.className = 'status show ' + kind;
+    statusEl.textContent = msg;
+  }
+  function hideStatus() { statusEl.className = 'status'; }
+
+  // ── File intake ──
+  function acceptFile(f) {
+    if (!f || !f.type.startsWith('image/')) {
+      setStatus('err', 'El archivo debe ser una imagen.');
+      return;
+    }
+    currentFile = f;
+    if (currentObjectUrl) URL.revokeObjectURL(currentObjectUrl);
+    currentObjectUrl = URL.createObjectURL(f);
+
+    const box = $('box-up');
+    box.innerHTML = '<img alt="Imagen subida" />';
+    box.querySelector('img').src = currentObjectUrl;
+
+    const kb = (f.size / 1024).toFixed(0);
+    $('foot-up').innerHTML = `<span class="name">${escapeHtml(f.name)}</span> · ${kb} KB`;
+    btnRun.disabled = false;
+    hideStatus();
+    // reset resultado
+    resetResult();
+  }
+
+  function resetResult() {
+    $('box-cat').innerHTML = '<div class="empty">Sin resultado</div>';
+    $('foot-cat').textContent = 'Esperando identificación…';
+    $('res-name').textContent = '—';
+    $('res-toy').textContent = '—';
+    $('d-method').textContent = '—';
+    $('d-conf').textContent = '—';
+    $('d-manual').textContent = '—';
+    $('d-upc').textContent = '—';
+    $('d-toy').textContent = '—';
+    $('d-id').textContent = '—';
+    $('d-color').textContent = '—';
+    $('timings').innerHTML = '<div class="empty-state">Sin datos</div>';
+    $('sugg').innerHTML = '<div class="empty-state">Sin datos</div>';
+    $('ocr').textContent = '—';
+    $('json').textContent = '{}';
+    $('cap-meta').innerHTML = '<span class="pill time" id="pill-time">— ms</span>';
+    btnShot.disabled = true;
+    btnCopy.disabled = true;
+    lastJson = null;
+  }
+
+  drop.addEventListener('click', () => fileInput.click());
+  fileInput.addEventListener('change', (e) => { if (e.target.files[0]) acceptFile(e.target.files[0]); });
+  ['dragenter','dragover'].forEach(ev => drop.addEventListener(ev, (e) => {
+    e.preventDefault(); drop.classList.add('over');
+  }));
+  ['dragleave','drop'].forEach(ev => drop.addEventListener(ev, (e) => {
+    e.preventDefault(); drop.classList.remove('over');
+  }));
+  drop.addEventListener('drop', (e) => {
+    const f = e.dataTransfer.files && e.dataTransfer.files[0];
+    if (f) acceptFile(f);
+  });
+
+  // ── Identify ──
+  btnRun.addEventListener('click', async () => {
+    if (!currentFile) return;
+    btnRun.disabled = true;
+    btnShot.disabled = true;
+    btnCopy.disabled = true;
+    setStatus('run', 'Identificando… el pipeline corre en el backend (barcode → DINOv2 → OCR → decisión).');
+    clientLog(`POST /api/v1/identify · enviando ${currentFile.name}…`);
+
+    const t0 = performance.now();
+    try {
+      const fd = new FormData();
+      fd.append('image', currentFile, currentFile.name);
+      const brandVal = ($('brand') && $('brand').value) || '';
+      if (brandVal) {
+        fd.append('brand', brandVal);
+        clientLog(`marca declarada por ti: ${brandVal} (prior endurecido)`);
+      }
+
+      const res = await fetch('/api/v1/identify', { method: 'POST', body: fd });
+      const raw = await res.text();
+      const wall = Math.round(performance.now() - t0);
+      clientLog(`respuesta HTTP ${res.status} · ${raw.length} bytes · ${wall} ms wall-clock`, !res.ok);
+
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status} · ${raw.slice(0, 300)}`);
+      }
+      let data;
+      try { data = JSON.parse(raw); }
+      catch { throw new Error('Respuesta no es JSON: ' + raw.slice(0, 300)); }
+
+      lastJson = data;
+      render(data, wall);
+      clientLog(`OK · método ${methodName(data.method)} · confianza ${pct(data.confidence)} · ${data.needs_manual ? 'REQUIERE MANUAL' : 'auto-confirmado'}`);
+      setStatus('ok', `Listo en ${wall} ms · método ${methodName(data.method)} · confianza ${pct(data.confidence)}`);
+    } catch (err) {
+      console.error(err);
+      clientLog('ERROR: ' + err.message, true);
+      setStatus('err', 'Error: ' + err.message);
+    } finally {
+      btnRun.disabled = false;
+    }
+  });
+
+  // ── Render ──
+  function render(d, wall) {
+    const item = d.item || {};
+    const name = item.variant_name || item.name || (d.suggestions && d.suggestions[0] && d.suggestions[0].name) || '—';
+    const img = item.main_image_url || item.image_url || (item.metadata && item.metadata.visual_image) || '';
+
+    // Panel derecho: imagen del catálogo (vía proxy /lab/img → sin CORS)
+    const boxCat = $('box-cat');
+    if (img) {
+      const proxied = img.startsWith('data:') ? img : ('/lab/img?url=' + encodeURIComponent(img));
+      boxCat.innerHTML = '<img alt="Imagen del catálogo" />';
+      const im = boxCat.querySelector('img');
+      im.src = proxied;
+      im.onerror = () => { boxCat.innerHTML = '<div class="empty">Imagen del catálogo no cargó</div>'; };
+    } else {
+      boxCat.innerHTML = '<div class="empty">Sin imagen de catálogo</div>';
+    }
+
+    const brand = item.item_master && (item.item_master.manufacturer || item.item_master.brand) || item.brand || '';
+    const sub = (item.item_master && item.item_master.sub_brand) || item.sub_brand || '';
+    const scale = item.metadata && item.metadata.scale || item.scale || '';
+    const color = item.body_color || '';
+
+    $('foot-cat').innerHTML =
+      `<span class="name">${escapeHtml(name)}</span>` +
+      (color ? ` · ${escapeHtml(color)}` : '') +
+      (scale ? ` · ${escapeHtml(String(scale))}` : '');
+
+    $('res-name').textContent = name;
+    $('res-toy').textContent =
+      [item.toy_number || d.toy_number, item.sku_upc, brand, sub].filter(Boolean).join('  ·  ') || '—';
+
+    // Decisión
+    $('d-method').textContent = `${methodName(d.method)} (${d.method})`;
+    $('d-conf').textContent = pct(d.confidence);
+    $('d-manual').innerHTML = d.needs_manual
+      ? '<span style="color:var(--warn)">SÍ — requiere revisión</span>'
+      : '<span style="color:var(--ok)">NO — auto-confirmado</span>';
+    $('d-upc').textContent = d.upc || '—';
+    $('d-toy').textContent = d.toy_number || '—';
+    $('d-id').textContent = item.id || '—';
+
+    // Color: lo medido en la FOTO vs el body_color del catálogo
+    const imgColors = (d.debug && d.debug.image_colors) || [];
+    const bodyColor = item.body_color || (item.metadata && item.metadata.body_color) || null;
+    $('d-color').innerHTML =
+      `<span style="color:#F0ABFC">foto: ${imgColors.length ? escapeHtml(imgColors.join(', ')) : 'sin señal (ambigua)'}</span>` +
+      `  ·  ` +
+      `<span style="color:${bodyColor ? 'var(--txt)' : 'var(--muted)'}">catálogo: ${bodyColor ? escapeHtml(bodyColor) : 'N/D'}</span>`;
+
+    // Pills superiores
+    const tms = d.timings_ms || {};
+    const total = tms.total != null ? tms.total : wall;
+    $('cap-meta').innerHTML =
+      `<span class="pill method">${methodName(d.method)}</span>` +
+      `<span class="pill conf">${pct(d.confidence)}</span>` +
+      `<span class="pill ${d.needs_manual ? 'warn' : 'ok'}">${d.needs_manual ? 'REQUIERE MANUAL' : 'AUTO'}</span>` +
+      (imgColors.length
+        ? `<span class="pill" style="background:rgba(240,171,252,.12); color:#F0ABFC; border:1px solid rgba(240,171,252,.32)">COLOR FOTO ${escapeHtml(imgColors.join('/'))}</span>`
+        : '') +
+      `<span class="pill time">${total} ms total · ${wall} ms wall</span>`;
+
+    // Timings
+    const timEl = $('timings');
+    const entries = Object.entries(tms).filter(([k]) => k !== 'total');
+    const max = Math.max(1, ...entries.map(([, v]) => v), total || 1);
+    if (!entries.length) {
+      timEl.innerHTML = '<div class="empty-state">Sin desglose de tiempos</div>';
+    } else {
+      timEl.innerHTML = entries.map(([k, v]) => {
+        const w = Math.max(2, Math.round((v / max) * 100));
+        return `<div class="t"><div class="lbl">${escapeHtml(k)}</div>
+          <div class="track"><div class="fill" style="width:${w}%"></div></div>
+          <div class="ms">${v} ms</div></div>`;
+      }).join('') +
+      `<div class="t" style="margin-top:6px; padding-top:8px; border-top:1px solid var(--line)">
+        <div class="lbl" style="color:var(--txt)">total</div>
+        <div class="track"><div class="fill" style="width:100%; background:var(--gold)"></div></div>
+        <div class="ms" style="color:var(--gold)">${total} ms</div></div>`;
+    }
+
+    // Sugerencias
+    const suggEl = $('sugg');
+    const sugg = d.suggestions || [];
+    if (!sugg.length) {
+      suggEl.innerHTML = '<div class="empty-state">Sin sugerencias</div>';
+    } else {
+      suggEl.innerHTML = sugg.slice(0, 8).map((s, i) => {
+        const w = Math.max(3, Math.round((s.score || 0) * 100));
+        return `<div class="row">
+          <div class="rank">${i + 1}</div>
+          <div style="flex:1">
+            <div class="nm">${escapeHtml(s.name || s.id || '—')}${s.toy_number ? ` <span style="color:var(--muted); font-weight:500">· ${escapeHtml(s.toy_number)}</span>` : ''}</div>
+            <div class="bar" style="width:${w}%"></div>
+          </div>
+          <div class="sc">${(s.score != null ? s.score : 0).toFixed(3)}</div>
+        </div>`;
+      }).join('');
+    }
+
+    // OCR
+    $('ocr').textContent = (d.debug && d.debug.ocr_preview) || '—';
+
+    // JSON completo
+    $('json').textContent = JSON.stringify(d, null, 2);
+
+    btnShot.disabled = false;
+    btnCopy.disabled = false;
+  }
+
+  // ── Captura (incluye debug + comparativa) ──
+  btnShot.addEventListener('click', async () => {
+    const node = $('shot-area');
+    setStatus('run', 'Generando captura…');
+    try {
+      const canvas = await html2canvas(node, {
+        backgroundColor: '#0A0B0F',
+        scale: 2,
+        useCORS: true,
+        allowTaint: true,
+        logging: false,
+      });
+      const url = canvas.toDataURL('image/png');
+      const a = document.createElement('a');
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+      a.href = url;
+      a.download = `identify-lab-${stamp}.png`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setStatus('ok', 'Captura descargada. Envíame ese PNG y lo reviso.');
+    } catch (err) {
+      console.error(err);
+      // Fallback: si html2canvas falla por CORS de la imagen del catálogo,
+      // reintentamos con la imagen cacheada como dataURL.
+      try {
+        await inlineCatalogImage();
+        const canvas = await html2canvas(node, {
+          backgroundColor: '#0A0B0F', scale: 2, useCORS: true, allowTaint: true, logging: false,
+        });
+        const a = document.createElement('a');
+        a.href = canvas.toDataURL('image/png');
+        a.download = `identify-lab-${Date.now()}.png`;
+        document.body.appendChild(a); a.click(); a.remove();
+        setStatus('ok', 'Captura descargada (con imagen inlineada).');
+      } catch (err2) {
+        setStatus('err', 'No se pudo generar la captura: ' + err.message);
+      }
+    }
+  });
+
+  // Convierte la imagen del catálogo a dataURL (evita taint del canvas).
+  async function inlineCatalogImage() {
+    const img = $('box-cat').querySelector('img');
+    if (!img || !img.src) return;
+    if (img.src.startsWith('data:')) return;
+    const res = await fetch(img.src, { mode: 'cors' });
+    const blob = await res.blob();
+    const dataUrl = await new Promise((ok, fail) => {
+      const r = new FileReader();
+      r.onload = () => ok(r.result);
+      r.onerror = fail;
+      r.readAsDataURL(blob);
+    });
+    img.src = dataUrl;
+  }
+
+  // ── Copiar JSON ──
+  btnCopy.addEventListener('click', async () => {
+    if (!lastJson) return;
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(lastJson, null, 2));
+      setStatus('ok', 'JSON copiado al portapapeles.');
+    } catch {
+      setStatus('err', 'No se pudo copiar (permiso del navegador). Usa el bloque JSON.');
+    }
+  });
+
+  // ── Limpiar ──
+  btnClear.addEventListener('click', () => {
+    currentFile = null;
+    fileInput.value = '';
+    if (currentObjectUrl) { URL.revokeObjectURL(currentObjectUrl); currentObjectUrl = null; }
+    $('box-up').innerHTML = '<div class="empty">Sin imagen</div>';
+    $('foot-up').textContent = 'Esperando foto…';
+    btnRun.disabled = true;
+    resetResult();
+    hideStatus();
+  });
+
+  // ── Utilidades ya definidas arriba ──
+
+  // ══════════════════════════════════════════════════════════════════
+  // DEBUG EN VIVO (SSE)
+  // ══════════════════════════════════════════════════════════════════
+  const dbgLog = $('debug-log');
+  const liveDot = $('live-dot');
+  const liveLabel = $('live-label');
+  const dbgCount = $('dbg-count');
+  let dbgPaused = false;
+  let dbgEvents = [];
+  let es = null;
+  let esRetries = 0;
+
+  function ts(t) {
+    const d = t ? new Date(t * 1000) : new Date();
+    return d.toISOString().slice(11, 23); // HH:MM:SS.mmm
+  }
+
+  function pushDbg(stage, msg, t, isErr) {
+    if (dbgPaused) return;
+    if (dbgLog.querySelector('.empty-state')) dbgLog.innerHTML = '';
+    const ln = document.createElement('div');
+    ln.className = 'ln';
+    const tsEl = document.createElement('span');
+    tsEl.className = 'ts';
+    tsEl.textContent = ts(t);
+    const stg = document.createElement('span');
+    stg.className = 'stg ' + (stage || '').toLowerCase();
+    stg.textContent = stage || '—';
+    const m = document.createElement('span');
+    m.className = 'msg' + (isErr ? ' err' : '');
+    m.textContent = msg;
+    ln.appendChild(tsEl); ln.appendChild(stg); ln.appendChild(m);
+    dbgLog.appendChild(ln);
+
+    dbgEvents.push({ t: t || (Date.now() / 1000), stage, msg });
+    // recorta el DOM para no degenerar con miles de líneas
+    while (dbgLog.children.length > 600) dbgLog.removeChild(dbgLog.firstChild);
+    dbgLog.scrollTop = dbgLog.scrollHeight;
+    dbgCount.textContent = dbgEvents.length + ' eventos';
+  }
+
+  function setLive(state, label) {
+    liveDot.className = 'live-dot' + (state === 'on' ? ' on' : state === 'wait' ? ' wait' : '');
+    liveLabel.textContent = '· ' + label;
+  }
+
+  function connectSSE() {
+    if (es) { try { es.close(); } catch {} }
+    setLive('wait', 'conectando…');
+    es = new EventSource('/lab/stream');
+
+    es.onopen = () => {
+      esRetries = 0;
+      setLive('on', 'en vivo');
+      pushDbg('client', 'canal SSE abierto — listo para identificar');
+    };
+    es.onmessage = (ev) => {
+      setLive('on', 'en vivo');
+      try {
+        const d = JSON.parse(ev.data);
+        pushDbg(d.stage, d.msg, d.t);
+      } catch {
+        pushDbg('client', ev.data);
+      }
+    };
+    es.onerror = () => {
+      setLive('wait', 'reconectando…');
+      esRetries += 1;
+      if (esRetries > 25) {
+        pushDbg('error', 'SSE caído — recarga la página', null, true);
+        try { es.close(); } catch {}
+        es = null;
+      }
+    };
+  }
+
+  // Eventos del lado cliente (lo que ve el navegador)
+  function clientLog(msg, isErr) { pushDbg('client', msg, null, isErr); }
+
+  $('btn-dbg-copy').addEventListener('click', async () => {
+    const txt = dbgEvents.map(e => `${ts(e.t)}  [${e.stage}]  ${e.msg}`).join('\n');
+    try {
+      await navigator.clipboard.writeText(txt);
+      clientLog('debug copiado al portapapeles (' + dbgEvents.length + ' eventos)');
+    } catch {
+      clientLog('no se pudo copiar — selecciona el texto del panel', true);
+    }
+  });
+
+  $('btn-dbg-clear').addEventListener('click', () => {
+    dbgEvents = [];
+    dbgLog.innerHTML = '<div class="empty-state">Esperando eventos del pipeline…</div>';
+    dbgCount.textContent = '0 eventos';
+  });
+
+  $('btn-dbg-pause').addEventListener('click', (e) => {
+    dbgPaused = !dbgPaused;
+    e.target.textContent = dbgPaused ? '▶ Reanudar' : '⏸ Pausar';
+    clientLog(dbgPaused ? 'consola en PAUSA (los eventos no se pintan)' : 'consola reanudada');
+  });
+
+  connectSSE();
+
+  // ── Consejos de foto: plegable ──
+  const tipsEl = $('tips');
+  $('tips-toggle').addEventListener('click', () => {
+    const open = tipsEl.classList.toggle('open');
+    $('tips-toggle').setAttribute('aria-expanded', open ? 'true' : 'false');
+  });
+
+  // ── Utils ──
+  function methodName(m) {
+    return ({ b: 'Código de barras', o: 'OCR / texto', c: 'Visual (embedding)', m: 'Manual' })[m] || m || '—';
+  }
+  function pct(v) {
+    if (v == null) return '—';
+    return (v * 100).toFixed(1) + ' %';
+  }
+  function escapeHtml(s) {
+    return String(s == null ? '' : s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+
+  // Banner con el host real
+  $('endpoint-badge').textContent = 'POST /api/v1/identify · ' + location.host;
+})();
+</script>
+</body>
+</html>

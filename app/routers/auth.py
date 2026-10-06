@@ -93,14 +93,34 @@ def register(body: RegisterRequest) -> TokenResponse:
     return _tokens(doc)
 
 
-@router.post("/login", response_model=TokenResponse)
-def login(body: LoginRequest) -> TokenResponse:
+@router.post("/login")
+def login(body: dict):
     db = get_db()
-    user = db.users.find_one({"email": body.email.lower()})
-    if not user or not verify_password(body.password, user["pwd_hash"]):
+    email = body.get("email", "").lower()
+    password = body.get("password", "")
+    totp_code = body.get("totp_code", "")
+
+    user = db.users.find_one({"email": email})
+    if not user or not verify_password(password, user["pwd_hash"]):
         raise HTTPException(status_code=401, detail="Credenciales inválidas")
     if not user.get("is_active", True):
         raise HTTPException(status_code=403, detail="Cuenta desactivada")
+
+    # Si 2FA está activo, requerir código TOTP
+    if user.get("totp_enabled"):
+        if not totp_code:
+            return {
+                "requires_2fa": True,
+                "message": "Se requiere código de verificación",
+            }
+        import pyotp
+        secret = user.get("totp_secret")
+        if not secret:
+            raise HTTPException(status_code=500, detail="Error de configuración 2FA")
+        totp = pyotp.TOTP(secret)
+        if not totp.verify(totp_code, valid_window=1):
+            raise HTTPException(status_code=401, detail="Código 2FA inválido")
+
     return _tokens(user)
 
 
@@ -275,3 +295,122 @@ def magic_login(body: MagicLoginRequest) -> TokenResponse:
     db.users.update_one({"_id": user["_id"]}, {"$unset": {"magic_code": ""}})
     user.pop("magic_code", None)
     return _tokens(user)
+
+
+# ── 2FA (Two-Factor Authentication) ──────────────────────────────────────
+
+
+class TwoFactorSetupResponse(dict):
+    pass
+
+
+@router.post("/2fa/setup")
+async def setup_2fa(user: CurrentUser = Depends(get_current_user)) -> dict:
+    """Genera secreto TOTP y retorna URL para QR code."""
+    import pyotp
+
+    db = get_db()
+    db_user = db.users.find_one({"_id": oid(user.id)})
+    email = db_user.get("email", user.username) if db_user else user.username
+
+    secret = pyotp.random_base32()
+    # Guardar secreto (no activo hasta verificar)
+    db.users.update_one(
+        {"_id": oid(user.id)},
+        {"$set": {"totp_secret": secret, "totp_enabled": False}},
+    )
+
+    # Generar URL para apps autenticadoras
+    totp = pyotp.TOTP(secret)
+    provisioning_uri = totp.provisioning_uri(
+        name=email,
+        issuer_name="Mini GT Collector",
+    )
+
+    return {
+        "secret": secret,
+        "qr_url": provisioning_uri,
+        "enabled": False,
+    }
+
+
+@router.post("/2fa/enable")
+async def enable_2fa(
+    body: dict,
+    user: CurrentUser = Depends(get_current_user),
+) -> dict:
+    """Verifica código TOTP y activa 2FA."""
+    import pyotp
+
+    code = body.get("code", "")
+    if not code or len(code) != 6:
+        raise HTTPException(status_code=400, detail="Código de 6 dígitos requerido")
+
+    db = get_db()
+    db_user = db.users.find_one({"_id": oid(user.id)})
+    secret = db_user.get("totp_secret") if db_user else None
+    if not secret:
+        raise HTTPException(status_code=400, detail="Primero ejecuta /2fa/setup")
+
+    totp = pyotp.TOTP(secret)
+    if not totp.verify(code, valid_window=1):
+        raise HTTPException(status_code=400, detail="Código inválido")
+
+    # Activar 2FA
+    db.users.update_one(
+        {"_id": oid(user.id)},
+        {"$set": {"totp_enabled": True}},
+    )
+    return {"enabled": True, "message": "2FA activado correctamente"}
+
+
+@router.post("/2fa/disable")
+async def disable_2fa(
+    body: dict,
+    user: CurrentUser = Depends(get_current_user),
+) -> dict:
+    """Desactiva 2FA (requiere código TOTP válido)."""
+    import pyotp
+
+    code = body.get("code", "")
+    if not code or len(code) != 6:
+        raise HTTPException(status_code=400, detail="Código de 6 dígitos requerido")
+
+    db = get_db()
+    db_user = db.users.find_one({"_id": oid(user.id)})
+    secret = db_user.get("totp_secret") if db_user else None
+    if not secret or not db_user.get("totp_enabled"):
+        raise HTTPException(status_code=400, detail="2FA no está activo")
+
+    totp = pyotp.TOTP(secret)
+    if not totp.verify(code, valid_window=1):
+        raise HTTPException(status_code=400, detail="Código inválido")
+
+    db.users.update_one(
+        {"_id": oid(user.id)},
+        {"$set": {"totp_enabled": False}, "$unset": {"totp_secret": ""}},
+    )
+    return {"enabled": False, "message": "2FA desactivado"}
+
+
+@router.post("/2fa/verify")
+async def verify_2fa(
+    body: dict,
+    user: CurrentUser = Depends(get_current_user),
+) -> dict:
+    """Verifica un código TOTP sin cambiar estado (para login)."""
+    import pyotp
+
+    code = body.get("code", "")
+    if not code or len(code) != 6:
+        return {"valid": False}
+
+    db = get_db()
+    db_user = db.users.find_one({"_id": oid(user.id)})
+    secret = db_user.get("totp_secret") if db_user else None
+    if not secret or not db_user.get("totp_enabled"):
+        return {"valid": False, "error": "2FA no activo"}
+
+    totp = pyotp.TOTP(secret)
+    valid = totp.verify(code, valid_window=1)
+    return {"valid": valid}

@@ -1,21 +1,33 @@
-# AWS Lambda container image — FastAPI + TensorFlow + Tesseract
-FROM public.ecr.aws/lambda/python:3.12
+# Lambda container image usando Debian + Lambda Runtime Interface Client
+# Más simple que copiar libs individualmente
+FROM python:3.12-slim
 
 # Tesseract + idiomas + OpenCV deps
-RUN yum update -y && yum install -y \
-    tesseract \
-    tesseract-eng \
-    tesseract-spa \
-    mesa-libGL \
-    mesa-libGLU \
-    && yum clean all
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    tesseract-ocr \
+    tesseract-ocr-eng \
+    tesseract-ocr-spa \
+    libgl1 \
+    libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV TESSDATA_PREFIX=/usr/share/tesseract-ocr/5/tessdata
+ENV MPLCONFIGDIR=/tmp/matplotlib
+ENV EASYOCR_MODULE_PATH=/app/easyocr_models
+
+WORKDIR /app
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt awslambdaric
 
-# Copiar app completa
-COPY app/ ${LAMBDA_TASK_ROOT}/app/
-COPY lambda_handler.py ${LAMBDA_TASK_ROOT}/
+# Pre-descargar modelos de EasyOCR y YOLO en el build (no en runtime)
+RUN python3 -c "import easyocr; reader = easyocr.Reader(['en', 'es'], gpu=False, verbose=False); print('EasyOCR models OK')"
+RUN python3 -c "from ultralytics import YOLO; YOLO('yolov8n.pt'); print('YOLOv8n OK')"
 
-# Handler de Lambda
+COPY app/ app/
+COPY data/ data/
+COPY lambda_handler.py .
+
+# Lambda Runtime Interface Client como entrypoint
+ENTRYPOINT ["/usr/local/bin/python", "-m", "awslambdaric"]
 CMD ["lambda_handler.handler"]

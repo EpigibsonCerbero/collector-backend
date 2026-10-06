@@ -26,6 +26,10 @@ class Settings(BaseSettings):
 
     # Seed del catálogo Mini GT scrapeado
     catalog_seed_path: str = "../data/minigt-catalog.json"
+    # Seed del catálogo Hot Wheels / Mattel scrapeado
+    hotwheels_catalog_seed_path: str = "../data/hotwheels-catalog.json"
+    # Seed multi-marca diecast extra (Inno64, Tarmac, Kaido…) — cualquier escala
+    diecast_extra_seed_path: str = "../data/diecast-extra-catalog.json"
 
 
 @lru_cache

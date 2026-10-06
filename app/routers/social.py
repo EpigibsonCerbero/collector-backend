@@ -1,9 +1,11 @@
 """Eventos diecast (convenciones, meets, drops) y chat P2P."""
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
+from typing import Dict, Set
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
 from pymongo import DESCENDING, ReturnDocument
 
 from app.db import get_db, oid, serialize
@@ -128,3 +130,93 @@ def add_message(
 @chat_router.delete("/{thread_id}", status_code=204)
 def clear_thread(thread_id: str, user: CurrentUser = Depends(get_current_user)) -> None:
     get_db().chat_messages.delete_many({"thread_id": thread_id})
+
+
+# ── WebSocket: tiempo real ───────────────────────────────────────────────
+
+
+class ChatConnectionManager:
+    """Gestiona conexiones WebSocket activas por thread_id."""
+
+    def __init__(self) -> None:
+        self._active: Dict[str, Set[WebSocket]] = {}
+
+    async def connect(self, thread_id: str, ws: WebSocket) -> None:
+        await ws.accept()
+        self._active.setdefault(thread_id, set()).add(ws)
+
+    def disconnect(self, thread_id: str, ws: WebSocket) -> None:
+        conns = self._active.get(thread_id)
+        if conns:
+            conns.discard(ws)
+            if not conns:
+                del self._active[thread_id]
+
+    async def broadcast(self, thread_id: str, message: dict) -> None:
+        conns = self._active.get(thread_id, set())
+        dead: list[WebSocket] = []
+        for ws in conns:
+            try:
+                await ws.send_text(json.dumps(message, default=str))
+            except Exception:
+                dead.append(ws)
+        for ws in dead:
+            self.disconnect(thread_id, ws)
+
+
+chat_ws_manager = ChatConnectionManager()
+
+
+@chat_router.websocket("/ws/{thread_id}")
+async def chat_ws(websocket: WebSocket, thread_id: str) -> None:
+    """
+    WebSocket para chat en tiempo real.
+    Cliente envía: {"text": "...", "type": "text"} o {"action": "ping"}
+    Servidor emite: {"type": "message", "data": {...}} o {"type": "ack", ...}
+    """
+    await chat_ws_manager.connect(thread_id, websocket)
+    try:
+        while True:
+            raw = await websocket.receive_text()
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError:
+                await websocket.send_text(json.dumps({"type": "error", "detail": "JSON inválido"}))
+                continue
+
+            action = payload.get("action")
+            if action == "ping":
+                await websocket.send_text(json.dumps({"type": "pong"}))
+                continue
+
+            # Nuevo mensaje
+            text = payload.get("text")
+            if not text:
+                await websocket.send_text(json.dumps({"type": "error", "detail": "text requerido"}))
+                continue
+
+            doc = {
+                "thread_id": thread_id,
+                "sender": payload.get("sender", "user"),
+                "author_name": payload.get("author_name"),
+                "text": text,
+                "type": payload.get("type", "text"),
+                "photo_url": payload.get("photo_url"),
+                "seal_code": payload.get("seal_code"),
+                "condition": payload.get("condition"),
+                "amount": payload.get("amount"),
+                "timestamp": _now().isoformat(),
+            }
+            res = get_db().chat_messages.insert_one(doc)
+            doc["_id"] = res.inserted_id
+            msg_out = ChatMessageOut(**serialize(doc))  # type: ignore[arg-type]
+
+            # Broadcast a todos los conectados en este thread
+            await chat_ws_manager.broadcast(
+                thread_id,
+                {"type": "message", "data": msg_out.model_dump()},
+            )
+    except WebSocketDisconnect:
+        pass
+    finally:
+        chat_ws_manager.disconnect(thread_id, websocket)
