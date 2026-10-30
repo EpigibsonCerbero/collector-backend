@@ -825,22 +825,13 @@ _reconcile_lock = threading.Lock()
 def _reconcile_allowed(user_id: str) -> bool:
     now = time.monotonic()
     with _reconcile_lock:
+        for k in [k for k, t in _last_reconcile.items() if now - t > 600]:
+            del _last_reconcile[k]
         last = _last_reconcile.get(user_id)
         if last is not None and now - last < _RECONCILE_EVERY_S:
             return False
         _last_reconcile[user_id] = now
         return True
-
-
-def _premium_state(db, user_id: str) -> tuple[bool, bool]:
-    """(es premium, su vencimiento ya pasó y sigue por gracia)."""
-    premium = subs.is_premium(db, user_id)
-    expired = False
-    if premium:
-        doc = db.subscriptions.find_one({"user_id": user_id}) or {}
-        exp = doc.get("expires_at")
-        expired = exp is not None and subs._utc(exp) < datetime.now(timezone.utc)
-    return premium, expired
 
 
 async def _reconcile(db, user_id: str) -> None:
@@ -874,45 +865,52 @@ async def _identify_guarded(
         raise HTTPException(status_code=413, detail="Imagen muy grande (máx 12 MB)")
 
     uid = user.id
-    quota_on = get_settings().scan_limit_enabled
-    db = get_db() if quota_on else None
-    reserved = False
-    premium = False
-    if quota_on:
-        premium, expired = await asyncio.to_thread(_premium_state, db, uid)
+    st = get_settings()
+    if not st.scan_limit_enabled:
+        async with _IDENTIFY_SLOTS:
+            return await asyncio.to_thread(_run_identify, data, brand)
+
+    db = get_db()
+    held = {"reserved": False}  # lo fija el hilo: sobrevive a una cancelación
+
+    def _reserve() -> tuple[bool, int]:
+        ok, n = subs.reserve_scan(db, uid, skip_premium_check=True)
+        if ok:
+            held["reserved"] = True
+        return ok, n
+
+    keep = False
+    try:
+        premium, expired = await asyncio.to_thread(subs.premium_state, db, uid)
         if premium and expired:
             await _reconcile(db, uid)
-            premium, _ = await asyncio.to_thread(_premium_state, db, uid)
+            premium, _ = await asyncio.to_thread(subs.premium_state, db, uid)
+        used = 0
         if not premium:
-            ok, _used = await asyncio.to_thread(subs.reserve_scan, db, uid)
+            ok, used = await asyncio.to_thread(_reserve)
             if not ok:
                 await _reconcile(db, uid)
                 premium = await asyncio.to_thread(subs.is_premium, db, uid)
                 if not premium:
-                    ok, _used = await asyncio.to_thread(subs.reserve_scan, db, uid)
+                    ok, used = await asyncio.to_thread(_reserve)
                     if not ok:
                         # Antes del semáforo: un 402 no ocupa slot de CPU.
                         return _quota_denied()
-            reserved = not premium
+                else:
+                    used = 0
 
-    try:
         async with _IDENTIFY_SLOTS:
             out = await asyncio.to_thread(_run_identify, data, brand)
-    except BaseException:
-        if reserved:
+        if held["reserved"] and out.item is None and not out.suggestions:
             await asyncio.to_thread(subs.release_scan, db, uid)
-        raise
-    if reserved and out.item is None and not out.suggestions:
-        await asyncio.to_thread(subs.release_scan, db, uid)
-        reserved = False
-    if quota_on:
-        status_ = await asyncio.to_thread(subs.get_status, db, uid)
-        out.quota = {
-            "used": int(status_["scans_used"]),
-            "limit": get_settings().free_daily_scans,
-            "premium": premium,
-        }
-    return out
+            held["reserved"] = False
+            used = max(0, used - 1)
+        out.quota = {"used": used, "limit": st.free_daily_scans, "premium": premium}
+        keep = True
+        return out
+    finally:
+        if held["reserved"] and not keep:
+            await asyncio.to_thread(subs.release_scan, db, uid)
 
 
 @router.post("/identify", response_model=IdentifyOut)

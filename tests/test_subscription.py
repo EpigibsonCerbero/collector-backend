@@ -424,7 +424,7 @@ def test_identify_402_after_20_with_flag_on():
     body = r.json()
     assert isinstance(body["detail"], str)
     assert body["code"] == "scan_limit_reached" and body["limit"] == 20
-    assert body["resets_at"] == sub.next_reset().isoformat() or body["resets_at"].startswith("20")
+    assert body["resets_at"] == sub.next_reset().isoformat()
     assert _used(uid) == 20
 
 
@@ -432,7 +432,9 @@ def test_identify_unlimited_when_flag_off(monkeypatch):
     monkeypatch.setattr(get_settings(), "scan_limit_enabled", False)
     uid = _user("off")
     for _ in range(25):
-        assert _scan(uid).status_code == 200
+        r = _scan(uid)
+        assert r.status_code == 200
+        assert r.json()["quota"] is None
     assert _used(uid) == 0
 
 
@@ -528,7 +530,31 @@ def test_expired_premium_in_grace_triggers_reconcile():
     assert r.status_code == 200 and m.call_count == 1
 
 
+def test_quota_failure_after_reserve_releases_scan():
+    uid = _user("leak")
+    class Bad:
+        item = {"id": "v1"}
+        suggestions: list = []
+
+        def __setattr__(self, k, v):  # falla al montar la respuesta, con la reserva ya hecha
+            raise RuntimeError("boom")
+
+    with _patch.object(identify_router, "_run_identify", return_value=Bad()):
+        c = TestClient(_iapi, raise_server_exceptions=False)
+        assert c.post(IDENT, json=_IMG, headers=_hdr(uid)).status_code == 500
+    assert _used(uid) == 0
+
+
+def test_free_scan_does_not_reread_premium_twice():
+    uid = _user("reads")
+    with _patch.object(sub, "is_premium", wraps=sub.is_premium) as m:
+        assert _scan(uid).status_code == 200
+    assert m.call_count == 0
+    assert _used(uid) == 1
+
+
 def test_register_blocked_after_5_per_ip():
+    ratelimit._hits.clear()
     codes = []
     for i in range(6):
         r = _ic.post("/api/v1/auth/register", json={

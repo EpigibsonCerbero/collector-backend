@@ -43,10 +43,7 @@ def _forced_premium(user_id: str) -> bool:
     return user_id in ids
 
 
-def is_premium(db, user_id: str, now: datetime | None = None) -> bool:
-    if _forced_premium(user_id):
-        return True
-    doc = db.subscriptions.find_one({"user_id": user_id})
+def _doc_premium(doc: dict | None, now: datetime | None = None) -> bool:
     if not doc or not doc.get("premium") or doc.get("revoked"):
         return False
     exp = doc.get("expires_at")
@@ -54,6 +51,22 @@ def is_premium(db, user_id: str, now: datetime | None = None) -> bool:
         return True
     grace = timedelta(days=get_settings().premium_grace_days)
     return _now(now) <= _utc(exp) + grace
+
+
+def is_premium(db, user_id: str, now: datetime | None = None) -> bool:
+    if _forced_premium(user_id):
+        return True
+    return _doc_premium(db.subscriptions.find_one({"user_id": user_id}), now)
+
+
+def premium_state(db, user_id: str, now: datetime | None = None) -> tuple[bool, bool]:
+    """(es premium, su vencimiento ya pasó y sigue dentro de la gracia). Una sola lectura."""
+    if _forced_premium(user_id):
+        return True, False
+    doc = db.subscriptions.find_one({"user_id": user_id})
+    premium = _doc_premium(doc, now)
+    exp = (doc or {}).get("expires_at")
+    return premium, bool(premium and exp is not None and _utc(exp) < _now(now))
 
 
 def get_status(db, user_id: str) -> dict[str, Any]:
@@ -106,13 +119,14 @@ def upsert_subscription(
     )
 
 
-def reserve_scan(db, user_id: str) -> tuple[bool, int]:
+def reserve_scan(db, user_id: str, skip_premium_check: bool = False) -> tuple[bool, int]:
     """Reserva un escaneo del día. Devuelve (permitido, usados tras reservar).
 
     Premium y cuota apagada pasan siempre sin tocar el contador.
+    `skip_premium_check`: el llamador ya decidió que no es Premium (evita una lectura).
     """
     st = get_settings()
-    if not st.scan_limit_enabled or is_premium(db, user_id):
+    if not st.scan_limit_enabled or (not skip_premium_check and is_premium(db, user_id)):
         usage = db.scan_usage.find_one({"user_id": user_id, "day": today_key()}) or {}
         return True, int(usage.get("count", 0))
     limit = st.free_daily_scans

@@ -67,7 +67,9 @@ def register(body: RegisterRequest, request: Request) -> TokenResponse:
     # Freno anti cuentas múltiples (cuota diaria gratis por usuario). Se usa
     # request.client.host y no client_ip(): X-Forwarded-For es falsificable sin
     # proxy delante. Limitaciones aceptadas en v1: el contador es en memoria (se
-    # pierde al reiniciar) y una IP compartida (CGNAT, wifi) puede recibir 429.
+    # pierde al reiniciar), una IP compartida (CGNAT, wifi) puede recibir 429,
+    # los intentos fallidos o duplicados también cuentan y, sin request.client,
+    # todos comparten un único cubo.
     hit_or_429("register", request.client.host if request.client else "?", limit=5, per_seconds=86400)
     db = get_db()
     email = body.email.lower()
