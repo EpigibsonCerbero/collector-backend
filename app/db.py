@@ -202,6 +202,13 @@ INDEXES: dict[str, list[tuple[list[tuple[str, int]], dict[str, Any]]]] = {
         ([("user_id", ASCENDING), ("day", ASCENDING)], {"unique": True}),
         ([("created_at", ASCENDING)], {"expireAfterSeconds": 3 * 24 * 3600}),
     ],
+    "identify_receipts": [
+        ([("created_at", ASCENDING)], {"expireAfterSeconds": get_settings().ai_catalog_receipt_ttl_s}),
+        ([("user_id", ASCENDING), ("image_hash", ASCENDING)], {}),
+    ],
+    "ai_catalog_usage": [
+        ([("user_id", ASCENDING), ("day", ASCENDING)], {"unique": True}),
+    ],
 }
 
 

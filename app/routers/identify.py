@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import logging
 import re
 import threading
@@ -801,6 +802,8 @@ def _run_identify(image_bytes: bytes, brand: str | None = None) -> IdentifyOut:
         and _name_family_safe(res.matches[0].name) == _name_family_safe(res.matches[1].name)
     )
     out.debug["peritaje_available"] = bool(twins)
+    out.debug["top_score"] = float(top_score)
+    out.debug["twins"] = bool(twins)
     if twins:
         out.debug["peritaje_candidates"] = names[:8]
         out.debug["peritaje_hints"] = _livery_hints_for(db, out.suggestions)
@@ -863,6 +866,39 @@ def _quota_denied() -> JSONResponse:
     )
 
 
+def image_hash(image_bytes: bytes) -> str:
+    return hashlib.sha256(image_bytes).hexdigest()
+
+
+def write_receipt(db, user_id: str, image_bytes: bytes, top_score: float, twins: bool) -> None:
+    """Recibo de escaneo manual (TTL). Nunca lanza: no puede romper el identify."""
+    try:
+        db.identify_receipts.insert_one(
+            {
+                "user_id": user_id,
+                "image_hash": image_hash(image_bytes),
+                "top_score": float(top_score),
+                "twins": bool(twins),
+                "created_at": datetime.now(timezone.utc),
+            }
+        )
+    except Exception:  # noqa: BLE001
+        _log.warning("identify_receipt: no se pudo escribir", exc_info=True)
+
+
+async def _maybe_receipt(db, uid: str, data: bytes, out: "IdentifyOut") -> None:
+    if not get_settings().ai_catalog_enabled or not out.needs_manual or out.item is not None:
+        return
+    await asyncio.to_thread(
+        write_receipt,
+        db,
+        uid,
+        data,
+        out.debug.get("top_score", 0.0),
+        bool(out.debug.get("twins", False)),
+    )
+
+
 async def _identify_guarded(
     request: Request, data: bytes, brand: Optional[str], user: CurrentUser
 ):
@@ -874,7 +910,9 @@ async def _identify_guarded(
     st = get_settings()
     if not st.scan_limit_enabled:
         async with _IDENTIFY_SLOTS:
-            return await asyncio.to_thread(_run_identify, data, brand)
+            out = await asyncio.to_thread(_run_identify, data, brand)
+        await _maybe_receipt(get_db(), uid, data, out)
+        return out
 
     db = get_db()
     held = {"reserved": False}  # lo fija el hilo: sobrevive a una cancelación
@@ -915,6 +953,7 @@ async def _identify_guarded(
             held["reserved"] = False
             used = max(0, used - 1)
         out.quota = {"used": used, "limit": st.free_daily_scans, "premium": premium}
+        await _maybe_receipt(db, uid, data, out)
         keep = True
         return out
     finally:

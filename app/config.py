@@ -31,6 +31,12 @@ class Settings(BaseSettings):
     revenuecat_secret_key: str = ""
     revenuecat_webhook_auth: str = ""
 
+    # Autocompletado de catálogo: crea piezas ausentes tras un escaneo manual.
+    ai_catalog_enabled: bool = False
+    ai_catalog_daily_cap: int = 10
+    ai_catalog_max_top_score: float = 0.75
+    ai_catalog_receipt_ttl_s: int = 600
+
     # Bootstrap admin (dev). Con la contraseña por defecto NO se crea y, si ya
     # existe con ella, se desactiva al arrancar (estaba publicada en el repo).
     seed_admin_email: str = "admin@collector.local"
