@@ -10,12 +10,13 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import io
 import logging
 import re
 import threading
 import time
 import unicodedata
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
@@ -27,7 +28,7 @@ from pydantic import BaseModel, Field
 
 from app.config import get_settings
 from app.db import as_id, get_db, oid, serialize, serialize_many
-from app.services import revenuecat, subscription as subs
+from app.services import ai_catalog, claude_vision, revenuecat, subscription as subs
 from app.services.debug_bus import publish as _dbg
 from app.services.vision import (
     VisionMatch,
@@ -1010,6 +1011,110 @@ async def identify_b64(
     except Exception:
         raise HTTPException(status_code=400, detail="image_base64 inválido")
     return await _identify_guarded(request, data, body.brand, user)
+
+
+class ResolveNewIn(BaseModel):
+    """Foto ya escaneada (mismo formato que `/identify/base64`)."""
+
+    image_base64: str
+
+
+def _decode_image_b64(raw: str) -> bytes:
+    if "," in raw and raw.strip().startswith("data:"):
+        raw = raw.split(",", 1)[1]
+    try:
+        data = base64.b64decode(raw, validate=False)
+    except Exception:
+        raise HTTPException(status_code=400, detail="image_base64 inválido")
+    if not data:
+        raise HTTPException(status_code=400, detail="Falta la imagen")
+    if len(data) > _MAX_IMAGE_BYTES:
+        raise HTTPException(status_code=413, detail="Imagen muy grande (máx 12 MB)")
+    return data
+
+
+def _check_image(data: bytes) -> bool:
+    from PIL import Image
+
+    try:
+        with Image.open(io.BytesIO(data)) as im:
+            im.verify()
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _valid_receipt(db, uid: str, ihash: str) -> dict | None:
+    """Recibo más reciente y vigente de (usuario, foto). El índice TTL puede ir
+    con retraso: la vigencia se comprueba aquí también."""
+    ttl = get_settings().ai_catalog_receipt_ttl_s
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=ttl)
+    for doc in db.identify_receipts.find({"user_id": uid, "image_hash": ihash}).sort("created_at", -1).limit(5):
+        at = doc.get("created_at")
+        if not isinstance(at, datetime):
+            continue
+        if at.tzinfo is None:
+            at = at.replace(tzinfo=timezone.utc)  # PyMongo devuelve naive en UTC
+        if at >= cutoff:
+            return doc
+    return None
+
+
+def _resolve_new_work(db, uid: str, data: bytes, receipt: dict) -> tuple[str, dict | None]:
+    """(decisión para el log, pieza o None). Bloqueante: IA, recorte, embed, Mongo."""
+    try:
+        read = claude_vision.read_for_catalog(data)
+    except Exception:  # noqa: BLE001
+        read = None
+    if read is None:
+        return "no_ai", None
+    reason = ai_catalog.gate(read, receipt)
+    if reason:
+        return f"rejected:{reason}", None
+    try:
+        piece = ai_catalog.create_from_read(db, uid, read, data)
+    except Exception:  # noqa: BLE001
+        _log.warning("ai_catalog: alta fallida user=%s", uid, exc_info=True)
+        return "uncertain:error", None
+    outcome = piece.get("outcome")
+    if outcome == "created":
+        ai_catalog.consume_daily(db, uid)
+    elif outcome != "duplicate":
+        return f"uncertain:{piece.get('reason') or 'unknown'}", None
+    # Un escaneo sirve para una sola pieza: sin repetición para gastar llamadas.
+    db.identify_receipts.delete_many({"user_id": uid, "image_hash": receipt.get("image_hash")})
+    return outcome, ai_catalog.strip_internal(piece)
+
+
+@router.post("/identify/resolve-new", response_model=IdentifyOut)
+async def identify_resolve_new(
+    body: ResolveNewIn,
+    user: CurrentUser = Depends(get_current_user),
+) -> IdentifyOut:
+    """Tras un identify manual: intenta dar de alta la pieza que falta.
+
+    Rechazos → `IdentifyOut` manual (la app sigue su flujo). No reserva cuota
+    de escaneos: ya la pagó el identify que dejó el recibo."""
+    if not get_settings().ai_catalog_enabled:
+        return IdentifyOut()
+    data = _decode_image_b64(body.image_base64)
+    if not await asyncio.to_thread(_check_image, data):
+        raise HTTPException(status_code=400, detail="image_base64 inválido")
+    uid = user.id
+    db = get_db()
+    receipt = await asyncio.to_thread(_valid_receipt, db, uid, image_hash(data))
+    if receipt is None:
+        raise HTTPException(status_code=403, detail="Escanea la pieza de nuevo")
+    hit_or_429("resolve_new", uid, limit=6, per_seconds=600)
+    if await asyncio.to_thread(ai_catalog.daily_cap_reached, db, uid):
+        _log.info("ai_catalog cap user=%s", uid)
+        return IdentifyOut()
+    async with _IDENTIFY_SLOTS:
+        decision, piece = await asyncio.to_thread(_resolve_new_work, db, uid, data, receipt)
+    _log.info("ai_catalog %s user=%s", decision, uid)
+    if piece is None:
+        return IdentifyOut()
+    return IdentifyOut(method="o", confidence=0.95, needs_manual=False, item=piece)
 
 
 @router.post("/identify/peritaje", response_model=PeritajeOut)

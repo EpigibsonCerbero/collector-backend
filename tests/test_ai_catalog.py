@@ -841,3 +841,215 @@ def test_same_casting_scan_cap_is_uncertain(aienv, monkeypatch):
     out = aic.create_from_read(_db, "u1", _read(), PHOTO)
     assert out["outcome"] == "uncertain" and out["reason"] == "same_casting_scan_capped"
     assert _snapshot(aienv) == before
+
+
+# ── Task 5: endpoint POST /identify/resolve-new ────────────────────────────
+import base64 as _b64
+import logging as _logging
+from datetime import datetime as _dt, timedelta as _td
+
+from fastapi import FastAPI as _FastAPI
+from fastapi.testclient import TestClient as _TC
+
+from app.security import get_current_user as _gcu
+
+_api = _FastAPI()
+_api.include_router(idn.router, prefix="/api/v1")
+_client = _TC(_api)
+_URL = "/api/v1/identify/resolve-new"
+
+
+@pytest.fixture
+def rn(aienv, monkeypatch):
+    """Endpoint con sesión simulada, IA simulada y pipeline pesado de aienv."""
+    who = {"id": "u1"}
+    _api.dependency_overrides[_gcu] = lambda: CurrentUser({"id": who["id"], "username": who["id"]})
+    calls = []
+    state = {"read": _read(), "who": who, "calls": calls}
+
+    def fake_read(data):
+        calls.append(data)
+        r = state["read"]
+        if isinstance(r, Exception):
+            raise r
+        return dict(r) if r else r
+
+    monkeypatch.setattr(cv, "read_for_catalog", fake_read)
+    yield state
+    _api.dependency_overrides.clear()
+
+
+def _post(img=PHOTO, raw=None, headers=None):
+    body = {"image_base64": raw if raw is not None else _b64.b64encode(img).decode()}
+    return _client.post(_URL, json=body, headers=headers or {})
+
+
+def _receipt(uid="u1", img=PHOTO, top=0.3, twins=False, age_s=0):
+    _db.identify_receipts.insert_one({
+        "user_id": uid, "image_hash": idn.image_hash(img), "top_score": top, "twins": twins,
+        "created_at": _dt.now(timezone.utc) - _td(seconds=age_s),
+    })
+
+
+def _is_manual(j):
+    return j["method"] == "m" and j["needs_manual"] is True and j["item"] is None and j["suggestions"] == []
+
+
+def test_disabled_returns_manual_without_calling_ai(rn, monkeypatch):
+    monkeypatch.setattr(get_settings(), "ai_catalog_enabled", False)
+    _receipt()
+
+    class Boom:
+        def __getattr__(self, n):
+            raise AssertionError("no DB con el flag apagado")
+
+    monkeypatch.setattr(idn, "get_db", lambda: Boom())
+    r = _post()
+    assert r.status_code == 200 and _is_manual(r.json())
+    assert rn["calls"] == [] and _rows() == 0
+
+
+def test_requires_session_401(rn):
+    _api.dependency_overrides.clear()
+    _receipt()
+    assert _post().status_code == 401
+    assert rn["calls"] == []
+
+
+def test_invalid_image_400(rn):
+    _receipt()
+    assert _post(raw="%%%no-base64%%%").status_code == 400
+    assert _post(raw=_b64.b64encode(b"not an image").decode()).status_code == 400
+    assert _post(raw="").status_code == 400
+    assert rn["calls"] == []
+
+
+def test_data_url_prefix_accepted(rn):
+    _receipt()
+    r = _post(raw="data:image/jpeg;base64," + _b64.b64encode(PHOTO).decode())
+    assert r.status_code == 200 and r.json()["method"] == "o"
+
+
+def test_no_receipt_403_and_no_ai_call(rn):
+    r = _post()
+    assert r.status_code == 403 and rn["calls"] == [] and _rows() == 0
+
+
+def test_receipt_for_other_image_403(rn):
+    _receipt(img=_jpeg((0, 200, 0)))
+    assert _post().status_code == 403
+    _receipt(uid="u2")  # misma foto, otro usuario
+    assert _post().status_code == 403
+    assert rn["calls"] == []
+
+
+def test_expired_receipt_403(rn):
+    ttl = get_settings().ai_catalog_receipt_ttl_s
+    _receipt(age_s=ttl + 5)  # el índice TTL aún no lo borró
+    assert _post().status_code == 403 and rn["calls"] == []
+    _receipt(age_s=ttl - 30)
+    assert _post().status_code == 200
+
+
+def test_success_returns_item_without_internal_flags(rn, caplog):
+    _receipt()
+    with caplog.at_level(_logging.INFO, logger=idn._log.name):
+        r = _post()
+    assert r.status_code == 200, r.text
+    j = r.json()
+    assert j["method"] == "o" and j["needs_manual"] is False and j["confidence"] >= 0.9
+    assert j["suggestions"] == []
+    item = j["item"]
+    for k in ("origin", "verified", "source_confidence", "confirmed_by", "created_by", "hidden",
+              "created", "outcome", "reason"):
+        assert k not in item
+    assert item["id"] == _db.variants.find_one({})["_id"] and _rows() == 1
+    assert item["item_master"]["manufacturer"] == "Mini GT"
+    _IVO(**item)  # mismo contrato que el item del identify
+    assert _db.ai_catalog_usage.find_one({"user_id": "u1"})["count"] == 1
+    assert len(rn["calls"]) == 1
+    msgs = [rec.getMessage() for rec in caplog.records if "ai_catalog" in rec.getMessage()]
+    assert msgs == ["ai_catalog created user=u1"]
+
+
+def test_receipt_consumed_no_replay(rn):
+    _receipt()
+    _receipt()  # dos escaneos de la misma foto: ninguno sirve tras el alta
+    assert _post().status_code == 200
+    assert _db.identify_receipts.count_documents({}) == 0
+    assert _post().status_code == 403
+    assert len(rn["calls"]) == 1
+
+
+def test_existing_piece_returned_not_created(rn):
+    _seed_variant(toy="MGT09999")
+    _receipt()
+    r = _post()
+    j = r.json()
+    assert r.status_code == 200 and j["method"] == "o" and j["needs_manual"] is False
+    assert j["item"]["id"] == "exist1" and "outcome" not in j["item"]
+    assert _rows() == 1
+    assert _db.ai_catalog_usage.count_documents({}) == 0  # no gasta el tope diario
+    assert _db.identify_receipts.count_documents({}) == 0  # recibo consumido
+
+
+def test_uncertain_returns_manual_keeps_receipt(rn, aienv, caplog):
+    aienv["truncate"] = True  # búsqueda textual no concluyente → «uncertain» real
+    _receipt()
+    with caplog.at_level(_logging.INFO, logger=idn._log.name):
+        r = _post()
+    assert r.status_code == 200 and _is_manual(r.json())
+    assert _rows() == 0 and aienv["appends"] == []
+    assert _db.identify_receipts.count_documents({}) == 1
+    assert _db.ai_catalog_usage.count_documents({}) == 0
+    assert "ai_catalog uncertain:text_search_truncated user=u1" in caplog.text
+
+
+def test_gate_rejection_returns_manual(rn):
+    _receipt(twins=True)
+    r = _post()
+    assert r.status_code == 200 and _is_manual(r.json()) and _rows() == 0
+    rn["read"] = _read(es_diecast=False)
+    _receipt(img=_jpeg((1, 2, 3)))
+    assert _is_manual(_post(img=_jpeg((1, 2, 3))).json()) and _rows() == 0
+
+
+def test_cap_reached_returns_manual(rn, monkeypatch):
+    monkeypatch.setattr(get_settings(), "ai_catalog_daily_cap", 1)
+    aic.consume_daily(_db, "u1")
+    _receipt()
+    r = _post()
+    assert r.status_code == 200 and _is_manual(r.json())
+    assert rn["calls"] == [] and _rows() == 0  # sobre el tope no cuesta nada
+
+
+def test_ai_error_returns_manual(rn):
+    _receipt()
+    rn["read"] = None
+    assert _is_manual(_post().json())
+    rn["read"] = RuntimeError("api down")
+    r = _post()
+    assert r.status_code == 200 and _is_manual(r.json())
+    assert _rows() == 0 and _db.identify_receipts.count_documents({}) == 1
+
+
+def test_rate_limited(rn):
+    rn["read"] = None  # cada llamada sale a manual y deja el recibo
+    _receipt()
+    for _ in range(6):
+        assert _post().status_code == 200
+    assert _post().status_code == 429
+    assert len(rn["calls"]) == 6
+    rn["who"]["id"] = "u2"  # el tope es por usuario
+    _receipt(uid="u2")
+    assert _post().status_code == 200
+
+
+def test_does_not_consume_extra_scan_quota(rn, monkeypatch):
+    monkeypatch.setattr(get_settings(), "scan_limit_enabled", True)
+    _db.scan_usage.insert_one({"user_id": "u1", "day": _subs.today_key(), "count": 5})
+    called = []
+    monkeypatch.setattr(_subs, "reserve_scan", lambda *a, **k: called.append(1) or (True, 6))
+    _receipt()
+    assert _post().json()["method"] == "o"
+    assert _db.scan_usage.find_one({"user_id": "u1"})["count"] == 5 and called == []
