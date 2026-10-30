@@ -502,7 +502,7 @@ def test_toy_number_uses_scraper_id():
     assert aic.piece_id(sid) == str(_uuid.uuid5(_NSID, "minigt-MGT00692"))
     assert aic.make_source_id(_read(toy_number="692")) == "minigt-MGT00692"
     sid2 = aic.make_source_id(_read())
-    assert sid2.startswith("ai-minigt-") and len(sid2) == len("ai-minigt-") + 12
+    assert sid2.startswith("x-minigt-") and len(sid2) == len("x-minigt-") + 12
     assert sid2 == aic.make_source_id(_read(livery="blue bayside"))
 
 
@@ -699,13 +699,13 @@ def test_no_livery_both_same_color_is_duplicate(aienv):
 
 def test_brand_spellings_share_slug_and_id():
     ids = {aic.make_source_id(_read(brand=b)) for b in ("Mini GT", "MiniGT", "TSM Mini GT", "mini-gt")}
-    assert len(ids) == 1 and ids.pop().startswith("ai-minigt-")
+    assert len(ids) == 1 and ids.pop().startswith("x-minigt-")
     assert aic.make_source_id(_read(brand="TSM MiniGT", toy_number="692")) == "minigt-MGT00692"
 
 
 def test_non_minigt_toy_is_metadata_only(aienv):
     sid = aic.make_source_id(_read(brand="Hot Wheels", casting="Twin Mill", toy_number="23"))
-    assert sid.startswith("ai-hw-")
+    assert sid.startswith("x-hw-")
     a = aic.create_from_read(_db, "u1", _read(brand="Hot Wheels", casting="Twin Mill", livery="Flames",
                                                color="rojo", toy_number="23"), PHOTO)
     doc = _db.variants.find_one({"_id": a["id"]})
@@ -1743,3 +1743,68 @@ def test_identify_resolve_hint_on_base64_route(monkeypatch):
         assert r.status_code == 200 and r.json()["debug"]["resolve_hint"] is True
     finally:
         _api.dependency_overrides.clear()
+
+
+# ── Revisión final I5: ninguna marca de origen llega a la app ───────────────
+
+_LEAK_KEYS = {"origin", "verified", "confirmed_by", "created_by", "source_confidence", "hidden",
+              "hidden_at", "user_submitted", "source_key", "created", "outcome", "reason"}
+
+
+def _walk_leaks(obj, path="$"):
+    bad = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k in _LEAK_KEYS:
+                bad.append(f"{path}.{k}")
+            bad += _walk_leaks(v, f"{path}.{k}")
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            bad += _walk_leaks(v, f"{path}[{i}]")
+    elif isinstance(obj, str):
+        low = obj.lower()
+        if low.startswith(("ai-", "x-")) or "aicat" in low or "source:'ai" in low:
+            bad.append(f"{path}={obj!r}")
+    return bad
+
+
+def test_ids_and_hash_are_neutral():
+    sid = aic.make_source_id(_read())
+    assert sid.startswith("x-minigt-") and "ai" not in sid.split("-")[0]
+    v = {"id": aic.piece_id(sid)}
+    assert v["id"] == str(_uuid.uuid5(_NSID, sid))
+
+
+def test_created_doc_keeps_seed_internal_and_neutral(aienv):
+    out = aic.create_from_read(_db, "u1", _read(), PHOTO)
+    doc = _db.variants.find_one({"_id": out["id"]})
+    assert doc["source_key"] == aic.make_source_id(_read())
+    assert "source_id" not in doc["metadata"]
+    assert doc["ai_local_hash"].startswith("h") and not doc["ai_local_hash"].startswith("ai")
+    assert len(doc["ai_local_hash"]) == 25
+    assert "aicat" not in (doc["main_image_url"] or "") and "/img_" in doc["main_image_url"]
+
+
+def test_no_ai_markers_reach_the_app(rn, gar):
+    client, coll = gar
+    _receipt()
+    j = _post().json()
+    assert j["method"] == "o"
+    vid = j["item"]["id"]
+    blobs = {"resolve_new": j["item"]}
+    doc, master = idn._find_variant_by_id(_db, vid)
+    blobs["identify"] = idn._variant_out(doc, master)
+    r = client.post("/api/v1/garage/items", json={"collection_id": coll, "item_variant_id": vid})
+    assert r.status_code == 201
+    blobs["garage"] = r.json()["item_variant"]
+    _db.variants.update_one({"_id": vid}, {"$set": {"toy_number": "MGT00692"}})
+    _catr._MASTER_CACHE["at"] = 0.0
+    lst = _catr.list_variants(_NS(headers={}), limit=100, offset=0, brand=None, rarity=None, search=None,
+                              manufacturer=None, sub_brand=None, scale=None, color=None, decade=None,
+                              sort="name", sort_dir="asc")
+    blobs["list"] = [v.model_dump() for v in lst]
+    blobs["detail"] = _catr.get_variant(vid).model_dump()
+    blobs["by_toy"] = [v.model_dump() for v in _catr.get_variants_by_toy("MGT00692")]
+    assert blobs["list"] and blobs["by_toy"]
+    for name, b in blobs.items():
+        assert _walk_leaks(b) == [], name

@@ -50,11 +50,14 @@ _BRAND_ALIASES = (
 # En el resto de marcas el número leído es metadato, nunca identidad.
 _TOY_ID_BRANDS = {"minigt"}
 
-# Campos internos de moderación/resultado: nunca salen hacia la app.
-_INTERNAL = (
+# Campos de moderación/origen de una pieza: nunca salen hacia la app. Lista
+# ÚNICA: la usan `strip_internal`, `confirm` y el `_variant_out` del identify.
+MODERATION_FIELDS = (
     "origin", "verified", "source_confidence", "confirmed_by", "created_by", "hidden",
-    "created", "outcome", "reason",
+    "hidden_at", "user_submitted", "source_key",
 )
+# Además, campos de resultado del alta (solo viven en la respuesta interna).
+_INTERNAL = MODERATION_FIELDS + ("created", "outcome", "reason")
 
 # Presupuesto de la búsqueda textual anti-duplicado. Corre fuera del identify
 # (no cuenta contra sus 8 s); si aun así se agota, el resultado es «incierto».
@@ -132,7 +135,8 @@ def make_source_id(read: dict) -> str:
     livery = read.get("livery")
     key = normalize_key(_brand_slug(read.get("brand")), read.get("casting"),
                         None if livery else read.get("color"), read.get("dorsal"), livery)
-    return f"ai-{slug}-{hashlib.sha1(key.encode('utf-8')).hexdigest()[:12]}"
+    # Prefijo neutro: la semilla no delata el origen (el id sale de aquí).
+    return f"x-{slug}-{hashlib.sha1(key.encode('utf-8')).hexdigest()[:12]}"
 
 
 def piece_id(source_id: str) -> str:
@@ -464,7 +468,7 @@ def _save_crop(img) -> str | None:
     try:
         buf = io.BytesIO()
         img.convert("RGB").save(buf, "JPEG", quality=90)
-        filename, _ = uploads._save_bytes(buf.getvalue(), ".jpg", "aicat")
+        filename, _ = uploads._save_bytes(buf.getvalue(), ".jpg", "img")
         return f"/api/v1/uploads/{filename}"
     except Exception:  # noqa: BLE001
         _log.warning("ai_catalog: no se pudo guardar el recorte", exc_info=True)
@@ -517,7 +521,7 @@ def create_from_read(db, user_id: str, read: dict, image_bytes: bytes) -> dict:
     vid = piece_id(source_id)
 
     url = _save_crop(crop) if crop is not None else None
-    metadata: dict = {"scale": "1/64", "source_id": source_id}
+    metadata: dict = {"scale": "1/64"}
     if year is not None:
         metadata["year"] = year
     if series:
@@ -528,7 +532,7 @@ def create_from_read(db, user_id: str, read: dict, image_bytes: bytes) -> dict:
 
     variant = {
         "id": vid,
-        "ai_local_hash": "ai-" + hashlib.sha1(source_id.encode("utf-8")).hexdigest()[:20],
+        "ai_local_hash": "h" + hashlib.sha1(source_id.encode("utf-8")).hexdigest()[:24],
         "variant_name": livery or color or casting,
         "toy_number": toy,
         "main_image_url": url,
@@ -544,6 +548,8 @@ def create_from_read(db, user_id: str, read: dict, image_bytes: bytes) -> dict:
         "verified": False,
         "source_confidence": read.get("confidence"),
         "confirmed_by": [],
+        # Clave interna de la semilla del id (nunca sale hacia la app).
+        "source_key": source_id,
     }
     # `items.release_year` es obligatorio en el esquema: 0 = año desconocido
     # (la app lo trata como falso y las facetas/orden por año lo ignoran).

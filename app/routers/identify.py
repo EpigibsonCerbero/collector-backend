@@ -198,8 +198,8 @@ class PeritajeOut(BaseModel):
 # ── Resolución contra Mongo ─────────────────────────────────────────────────
 
 
-# Campos de moderación de piezas de IA: nunca salen hacia la app.
-_MODERATION_FIELDS = ("origin", "verified", "source_confidence", "confirmed_by", "created_by", "hidden")
+# Campos de moderación/origen: nunca salen hacia la app (lista única en ai_catalog).
+_MODERATION_FIELDS = ai_catalog.MODERATION_FIELDS
 
 
 def _variant_out(doc: dict, master: dict | None = None) -> dict[str, Any]:
