@@ -1173,6 +1173,58 @@ def _ms(seconds: float) -> int:
     return int(round(seconds * 1000))
 
 
+# Caché en el recibo de lo ya pagado (lectura saneada + veredicto resumido):
+# un reintento sobre el mismo escaneo (p. ej. tras `uncertain:timeout`) no
+# vuelve a llamar a la IA ni a consumir el tope. Vigencia corta: pasada, se paga.
+_AI_CACHE_TTL_S = float(os.environ.get("RESOLVE_AI_CACHE_TTL_S", "600"))
+# Solo campos normalizados de la lectura (`claude_vision._norm_catalog`) y del
+# veredicto; nunca el texto libre del proveedor (`detalle`) ni claves extra.
+_READ_CACHE_KEYS = (
+    "es_diecast", "es_foto_real", "brand", "casting", "modelo", "color", "dorsal",
+    "livery", "texto", "toy_number", "serie", "year", "confidence",
+)
+_VERDICT_CACHE_KEYS = ("fisico", "texto_leido", "year_leido", "casting_leido")
+
+
+def _verdict_summary(verdict: dict) -> dict:
+    """Lo que deciden los chequeos (físico, texto, identidad); sin `detalle`."""
+    y = verdict.get("year_leido")
+    return {
+        "fisico": verdict.get("fisico") is True,
+        "texto_leido": str(verdict.get("texto_leido") or ""),
+        "year_leido": y if isinstance(y, int) and not isinstance(y, bool) else None,
+        "casting_leido": str(verdict.get("casting_leido") or ""),
+    }
+
+
+def _fresh_cache(receipt: dict, key: str) -> dict | None:
+    """Datos cacheados en el recibo si siguen vigentes (`_AI_CACHE_TTL_S`)."""
+    c = receipt.get(key)
+    if not isinstance(c, dict) or not isinstance(c.get("data"), dict):
+        return None
+    at = c.get("at")
+    if not isinstance(at, datetime):
+        return None
+    if at.tzinfo is None:
+        at = at.replace(tzinfo=timezone.utc)  # PyMongo devuelve naive en UTC
+    age = (datetime.now(timezone.utc) - at).total_seconds()
+    if age < 0 or age > _AI_CACHE_TTL_S:
+        return None
+    return dict(c["data"])
+
+
+def _save_cache(db, receipt: dict, key: str, data: dict) -> None:
+    if db is None or receipt.get("_id") is None:
+        return
+    try:
+        db.identify_receipts.update_one(
+            {"_id": receipt["_id"]},
+            {"$set": {key: {"data": data, "at": datetime.now(timezone.utc)}}},
+        )
+    except Exception:  # noqa: BLE001
+        _log.warning("ai_catalog: no se pudo cachear %s en el recibo", key, exc_info=True)
+
+
 def _read_and_gate(
     data: bytes,
     receipt: dict,
@@ -1181,6 +1233,8 @@ def _read_and_gate(
     uid: str | None = None,
     ai_deadline: float | None = None,
     timings: dict | None = None,
+    cached_read: dict | None = None,
+    cached_verdict: dict | None = None,
 ) -> tuple[str | None, dict | None]:
     """(motivo de rechazo o None, lectura). Red, sin CPU: va FUERA de `_IDENTIFY_SLOTS`.
     La barrera del recibo ya pasó antes de llegar aquí (sin coste).
@@ -1193,31 +1247,41 @@ def _read_and_gate(
     llamadas. Por defecto, `_RESOLVE_AI_BUDGET_S` desde ahora.
 
     `timings` (opcional): recibe `read_ms` y `verify_ms` medidos con `_mono()`.
+
+    `cached_read` / `cached_verdict` (de `_fresh_cache`): lectura saneada y
+    veredicto resumido ya pagados en este recibo. Con ellos no se llama a la
+    IA ni se reserva el tope; las barreras se vuelven a aplicar igual. Tras
+    pagar una lectura (o un veredicto no nulo) se guardan en el recibo.
     """
     if timings is None:
         timings = {}
     if ai_deadline is None:
         ai_deadline = _mono() + _RESOLVE_AI_BUDGET_S
-    left = ai_deadline - _mono()
-    if left < _RESOLVE_MIN_START_S:
-        print("[ai-catalog] sin tiempo para la lectura", flush=True)
-        return "no_ai", None
-    t_read = _mono()
-    try:
-        read = claude_vision.read_for_catalog(
-            data, timeout_s=max(_RESOLVE_MIN_TIMEOUT_S, left), opts=opts, deadline=ai_deadline
-        )
-    except Exception:  # noqa: BLE001
-        read = None
-    finally:
-        timings["read_ms"] = _ms(_mono() - t_read)
-    if read is None:
-        return "no_ai", None
-    clean = ai_catalog.sanitize_read(read)
-    if clean is None:
-        # URL o marcado en un campo guardable: rechazo (la lectura se pagó).
-        return "rejected:unsafe_text", read
-    read = clean
+    if cached_read is not None:
+        read = dict(cached_read)
+        timings["read_ms"] = "cache"
+    else:
+        left = ai_deadline - _mono()
+        if left < _RESOLVE_MIN_START_S:
+            print("[ai-catalog] sin tiempo para la lectura", flush=True)
+            return "no_ai", None
+        t_read = _mono()
+        try:
+            read = claude_vision.read_for_catalog(
+                data, timeout_s=max(_RESOLVE_MIN_TIMEOUT_S, left), opts=opts, deadline=ai_deadline
+            )
+        except Exception:  # noqa: BLE001
+            read = None
+        finally:
+            timings["read_ms"] = _ms(_mono() - t_read)
+        if read is None:
+            return "no_ai", None
+        clean = ai_catalog.sanitize_read(read)
+        if clean is None:
+            # URL o marcado en un campo guardable: rechazo (la lectura se pagó).
+            return "rejected:unsafe_text", read
+        read = clean
+        _save_cache(db, receipt, "read_cache", {k: read.get(k) for k in _READ_CACHE_KEYS})
     # Creación: barrera estricta (foto física + ancla de identidad + marca/modelo).
     reason = ai_catalog.gate_create(read)
     needs_rescue = reason == "low_confidence"
@@ -1226,39 +1290,48 @@ def _read_and_gate(
         return f"rejected:{reason}", read
     # Segunda opinión pericial (otra llamada pagada): el lector alucina en renders.
     # Sin tiempo para ella = sin verificador (no se crea; no se reserva la llamada).
-    left = ai_deadline - _mono()
-    if left < _RESOLVE_MIN_START_S:
-        print(f"[ai-catalog] rechazo no_verifier (sin tiempo: {left:.1f}s)", flush=True)
-        return _NO_VERIFIER, read
-    if db is not None and uid is not None:
-        try:
-            if not ai_catalog.reserve_ai_call(db, uid):
-                print("[ai-catalog] rechazo call_cap (verificación)", flush=True)
+    detalle_len = 0
+    if cached_verdict is not None:
+        verdict = dict(cached_verdict)
+        timings["verify_ms"] = "cache"
+    else:
+        left = ai_deadline - _mono()
+        if left < _RESOLVE_MIN_START_S:
+            print(f"[ai-catalog] rechazo no_verifier (sin tiempo: {left:.1f}s)", flush=True)
+            return _NO_VERIFIER, read
+        if db is not None and uid is not None:
+            try:
+                if not ai_catalog.reserve_ai_call(db, uid):
+                    print("[ai-catalog] rechazo call_cap (verificación)", flush=True)
+                    return "rejected:call_cap", read
+            except Exception:  # noqa: BLE001
                 return "rejected:call_cap", read
-        except Exception:  # noqa: BLE001
-            return "rejected:call_cap", read
-    verdict = None
-    t_verify = _mono()
-    try:
-        verdict = claude_vision.verify_real_object(
-            data,
-            opts,
-            timeout_s=max(_RESOLVE_MIN_TIMEOUT_S, ai_deadline - _mono()),
-            deadline=ai_deadline,
-        )
-    except Exception:  # noqa: BLE001
         verdict = None
-    finally:
-        timings["verify_ms"] = _ms(_mono() - t_verify)
-    if verdict is None:
-        # Sin segunda opinión (error, timeout, corte abierto, sin clave) NO se
-        # crea, ni con lectura «alto». Fallo transitorio: el recibo no se marca.
-        print("[ai-catalog] rechazo no_verifier (sin verificador)", flush=True)
-        return _NO_VERIFIER, read
+        t_verify = _mono()
+        try:
+            verdict = claude_vision.verify_real_object(
+                data,
+                opts,
+                timeout_s=max(_RESOLVE_MIN_TIMEOUT_S, ai_deadline - _mono()),
+                deadline=ai_deadline,
+            )
+        except Exception:  # noqa: BLE001
+            verdict = None
+        finally:
+            timings["verify_ms"] = _ms(_mono() - t_verify)
+        if verdict is None:
+            # Sin segunda opinión (error, timeout, corte abierto, sin clave) NO se
+            # crea, ni con lectura «alto». Fallo transitorio: el recibo no se marca.
+            # Un veredicto nulo NO se cachea: el reintento vuelve a verificar.
+            print("[ai-catalog] rechazo no_verifier (sin verificador)", flush=True)
+            return _NO_VERIFIER, read
+        detalle_len = len(verdict.get("detalle") or "")
+        verdict = _verdict_summary(verdict)
+        _save_cache(db, receipt, "verify_cache", {k: verdict[k] for k in _VERDICT_CACHE_KEYS})
     if verdict.get("fisico") is not True:
         print(
             f"[ai-catalog] rechazo not_foto_real (fisico={verdict.get('fisico')!r} "
-            f"detalle_len={len(verdict.get('detalle') or '')})",
+            f"detalle_len={detalle_len})",
             flush=True,
         )
         return "rejected:not_foto_real", read
@@ -1441,20 +1514,26 @@ async def identify_resolve_new(
     t0 = _mono()
     ai_deadline = t0 + _RESOLVE_AI_BUDGET_S
     total_deadline = t0 + _RESOLVE_TOTAL_BUDGET_S
-    # Tope de lecturas pagadas (usuario y global): se cuenta ANTES de pagar.
-    try:
-        allowed = await asyncio.to_thread(ai_catalog.reserve_ai_call, db, uid)
-    except Exception:  # noqa: BLE001
-        _log.warning("ai_catalog: no se pudo contar la lectura user=%s", uid, exc_info=True)
-        allowed = False
-    if not allowed:
-        _log.info("ai_catalog call_cap user=%s", uid)
-        return IdentifyOut()
+    # Lo ya pagado en este recibo (reintento tras un fallo transitorio): se
+    # reutiliza sin llamar a la IA ni consumir el tope (vigencia `_AI_CACHE_TTL_S`).
+    cached_read = _fresh_cache(receipt, "read_cache")
+    cached_verdict = _fresh_cache(receipt, "verify_cache") if cached_read is not None else None
+    if cached_read is None:
+        # Tope de lecturas pagadas (usuario y global): se cuenta ANTES de pagar.
+        try:
+            allowed = await asyncio.to_thread(ai_catalog.reserve_ai_call, db, uid)
+        except Exception:  # noqa: BLE001
+            _log.warning("ai_catalog: no se pudo contar la lectura user=%s", uid, exc_info=True)
+            allowed = False
+        if not allowed:
+            _log.info("ai_catalog call_cap user=%s", uid)
+            return IdentifyOut()
     # La lectura espera a la red: fuera del semáforo para no frenar los identify.
     # Modelo/velocidad/pensamiento: los fija el servidor (entorno), no el cliente.
     timings: dict = {}
     decision, read = await asyncio.to_thread(
-        _read_and_gate, data, receipt, None, db, uid, ai_deadline, timings
+        _read_and_gate, data, receipt, None, db, uid, ai_deadline, timings,
+        cached_read=cached_read, cached_verdict=cached_verdict,
     )
     piece = None
     if decision is None:

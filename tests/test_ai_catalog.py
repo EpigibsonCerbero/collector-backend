@@ -3294,3 +3294,108 @@ def test_m4_endpoint_truncated_trimmed_budget_keeps_receipt_retryable(rn, aienv,
     assert aienv["text_calls"][0][1] == pytest.approx(2.5) and log == []
     assert "ai_catalog uncertain:timeout user=u1" in caplog.text
     _assert_nothing_written(aienv, before)
+
+
+# M1: la lectura y el veredicto ya pagados se cachean en el recibo (10 min).
+
+
+def _ai_calls():
+    return (_db.ai_catalog_usage.find_one({"user_id": "u1"}) or {}).get("ai_calls", 0)
+
+
+def _slow_dup_once(clk, monkeypatch, secs=11.6):
+    real, n = aic.check_duplicate, []
+
+    def run(*a, **k):
+        n.append(1)
+        if len(n) == 1:
+            clk["t"] += secs  # solo el primer intento se queda sin reloj
+        return real(*a, **k)
+
+    monkeypatch.setattr(aic, "check_duplicate", run)
+    return n
+
+
+def test_m1_retry_after_timeout_reuses_read_and_verdict(rn, aienv, clk, monkeypatch):
+    _slow_dup_once(clk, monkeypatch)
+    _receipt()
+    assert _is_manual(_post().json())
+    assert len(rn["calls"]) == 1 and rn["verify_calls"] == 1 and _ai_calls() == 2
+    rec = _db.identify_receipts.find_one({})
+    assert not rec.get("ai_tried") and rec["read_cache"]["data"]["casting"] == "Nissan Skyline GT-R R34"
+    assert rec["verify_cache"]["data"]["fisico"] is True
+    j = _post().json()
+    assert j["method"] == "o" and _rows() == 1
+    assert len(rn["calls"]) == 1 and rn["verify_calls"] == 1  # sin llamar a Claude
+    assert _ai_calls() == 2  # sin consumir el tope
+    assert _db.identify_receipts.count_documents({}) == 0
+
+
+def test_m1_expired_cache_is_ignored(rn, aienv, clk, monkeypatch):
+    _slow_dup_once(clk, monkeypatch)
+    _receipt()
+    _post()
+    old = _dt.now(timezone.utc) - _td(seconds=idn._AI_CACHE_TTL_S + 1)
+    _db.identify_receipts.update_many({}, {"$set": {"read_cache.at": old, "verify_cache.at": old}})
+    assert _post().json()["method"] == "o"
+    assert len(rn["calls"]) == 2 and rn["verify_calls"] == 2 and _ai_calls() == 4
+
+
+def test_m1_cache_ttl_default_is_10_min():
+    assert idn._AI_CACHE_TTL_S == 600.0
+
+
+def test_m1_none_verdict_not_cached_but_read_is(rn, aienv, monkeypatch):
+    real_verify, n = cv.verify_real_object, []
+
+    def verify_none_once(*a, **k):
+        n.append(1)
+        return None if len(n) == 1 else real_verify(*a, **k)
+
+    monkeypatch.setattr(cv, "verify_real_object", verify_none_once)
+    _receipt()
+    assert _is_manual(_post().json())
+    rec = _db.identify_receipts.find_one({})
+    assert "read_cache" in rec and "verify_cache" not in rec and not rec.get("ai_tried")
+    assert _ai_calls() == 2
+    assert _post().json()["method"] == "o"
+    assert len(rn["calls"]) == 1 and len(n) == 2  # la lectura se reutiliza, el veredicto no
+    assert _ai_calls() == 3  # solo la verificación nueva
+
+
+def test_m1_receipt_stores_no_raw_provider_text(rn, aienv, clk, monkeypatch):
+    rn["read"] = dict(_read(), raw_provider="RAW-PROVIDER-TEXT")
+    monkeypatch.setattr(cv, "verify_real_object", lambda *a, **k: {
+        "fisico": True, "texto_leido": "Nissan Skyline GT-R R34 empaque", "marca_leido": "Mini GT",
+        "casting_leido": "Nissan Skyline GT-R R34", "year_leido": None, "detalle": "MODEL-RAW-DETAIL",
+        "extra": "RAW-EXTRA"})
+    _slow_dup_once(clk, monkeypatch)
+    _receipt()
+    _post()
+    rec = _db.identify_receipts.find_one({})
+    assert set(rec["verify_cache"]["data"]) == {"fisico", "texto_leido", "year_leido", "casting_leido"}
+    assert "raw_provider" not in rec["read_cache"]["data"]
+    blob = repr(rec)
+    assert "RAW-PROVIDER-TEXT" not in blob and "MODEL-RAW-DETAIL" not in blob and "RAW-EXTRA" not in blob
+
+
+def test_m1_cached_retry_reapplies_gate_create(rn, aienv, clk, monkeypatch):
+    _slow_dup_once(clk, monkeypatch)
+    _receipt()
+    _post()
+    monkeypatch.setattr(aic, "gate_create", lambda r: "missing_identity")
+    assert _is_manual(_post().json()) and _rows() == 0
+    assert len(rn["calls"]) == 1 and _ai_calls() == 2
+
+
+def test_m1_cached_retry_reapplies_identity_check(rn, aienv, clk, monkeypatch):
+    rn["read"] = _read(texto="Nissan Skyline GT-R R34 empaque 2023", year=2023)
+    _slow_dup_once(clk, monkeypatch)
+    _receipt()
+    _post()
+    # El veredicto cacheado contradice el año: el reintento debe aplicarlo de nuevo.
+    _db.identify_receipts.update_many({}, {"$set": {"verify_cache.data.year_leido": 2019}})
+    j = _post().json()
+    assert len(rn["calls"]) == 1 and _ai_calls() == 2
+    assert _is_manual(j) and _rows() == 0  # sin ancla tras quitar el texto en conflicto: no_anchor
+    assert _db.identify_receipts.find_one({})["ai_tried"] is True
