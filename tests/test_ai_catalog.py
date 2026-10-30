@@ -401,6 +401,7 @@ from app.services import ai_catalog as aic
 from app.services import car_segment as _seg
 from app.services import dinov2_embed as _emb
 from app.services import subscription as _subs
+from app.services import yolo_crop as _yolo
 
 _NSID = _uuid.UUID("a9f73cdf-180a-5bd7-ac02-42c291653666")
 
@@ -428,10 +429,20 @@ def aienv(monkeypatch, tmp_path):
         _db[coll].delete_many({})
     monkeypatch.setattr(_upl, "UPLOAD_DIR", tmp_path)
     crop = _Image.new("RGB", (32, 32), (10, 10, 200))
-    state = {"seg": _NS(image=crop), "appends": [], "embed_calls": [],
-             "text": [], "match": [], "text_calls": [], "match_calls": [], "truncate": False}
+    state = {"seg": _NS(image=crop, bbox=(8, 8, 56, 40)), "appends": [], "embed_calls": [],
+             "text": [], "match": [], "text_calls": [], "match_calls": [], "truncate": False,
+             "yolo": [(10, 10, 54, 38)], "yolo_calls": 0}
 
     monkeypatch.setattr(_seg, "isolate_car", lambda im, *a, **k: state["seg"])
+
+    def yolo(im):
+        state["yolo_calls"] += 1
+        y = state["yolo"]
+        if isinstance(y, Exception):
+            raise y
+        return list(y) if y is not None else None
+
+    monkeypatch.setattr(_yolo, "vehicle_boxes", yolo)
 
     def emb(im):
         state["embed_calls"].append(im)
@@ -1930,3 +1941,43 @@ def test_endpoint_unsafe_text_is_gate_rejection(rn, caplog):
     assert _rows() == 0 and len(rn["calls"]) == 1
     assert _db.identify_receipts.find_one({})["ai_tried"] is True
     assert "ai_catalog rejected:unsafe_text user=u1" in caplog.text
+
+
+# ── Revisión final I10: el recorte publicado debe ser un coche (YOLO) ──────
+
+
+def test_crop_published_when_yolo_box_overlaps(aienv):
+    out = aic.create_from_read(_db, "u1", _read(), PHOTO)
+    assert out["main_image_url"] and aienv["yolo_calls"] == 1
+
+
+@pytest.mark.parametrize("yolo", [None, [], RuntimeError("cuda"), [(60, 44, 64, 48)]])
+def test_no_image_when_yolo_unavailable_empty_error_or_elsewhere(aienv, yolo):
+    aienv["yolo"] = yolo
+    out = aic.create_from_read(_db, "u1", _read(), PHOTO)
+    assert out["outcome"] == "created"  # la pieza se crea igual, sin foto
+    assert out["main_image_url"] is None and out["images"] == []
+    assert list(_upl.UPLOAD_DIR.iterdir()) == []
+
+
+def test_no_image_when_segment_has_no_bbox(aienv):
+    aienv["seg"] = _NS(image=aienv["crop"])
+    out = aic.create_from_read(_db, "u1", _read(), PHOTO)
+    assert out["main_image_url"] is None
+
+
+def test_vehicle_boxes_filters_classes_and_fails_closed(monkeypatch):
+    class _B:
+        def __init__(self, cls, xyxy):
+            self.cls = [cls]
+            self.xyxy = [_NS(tolist=lambda: list(xyxy))]
+
+    class _M:
+        def predict(self, im, conf=0.25, verbose=False):
+            return [_NS(boxes=[_B(2, (1, 2, 30, 20)), _B(0, (0, 0, 5, 5)), _B(7, (3, 3, 9, 9))])]
+
+    monkeypatch.setattr(_yolo, "_get_yolo", lambda: _M())
+    img = _Image.new("RGB", (40, 30))
+    assert _yolo.vehicle_boxes(img) == [(1, 2, 30, 20), (3, 3, 9, 9)]
+    monkeypatch.setattr(_yolo, "_get_yolo", lambda: (_ for _ in ()).throw(ImportError("no ultralytics")))
+    assert _yolo.vehicle_boxes(img) is None

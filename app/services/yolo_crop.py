@@ -82,3 +82,21 @@ def detect_and_crop_vehicle(image_bytes: bytes) -> list[bytes]:
     except Exception as exc:
         print(f"[yolo] error: {type(exc).__name__}: {exc}", flush=True)
         return [image_bytes]
+
+
+def vehicle_boxes(im) -> list[tuple[float, float, float, float]] | None:
+    """Cajas (x0, y0, x1, y1) de vehículos COCO en una imagen PIL.
+
+    None si YOLO no está disponible o falla (el llamador decide sin él);
+    lista vacía si no hay ningún vehículo."""
+    try:
+        model = _get_yolo()
+        results = model.predict(im, conf=0.25, verbose=False)
+        boxes = []
+        for box in (results[0].boxes if results else None) or []:
+            if int(box.cls[0]) in _VEHICLE_CLASSES:
+                boxes.append(tuple(box.xyxy[0].tolist()))
+        return boxes
+    except Exception as exc:  # noqa: BLE001
+        print(f"[yolo] vehicle_boxes no disponible: {type(exc).__name__}", flush=True)
+        return None

@@ -561,6 +561,36 @@ class Prepared:
     im: object
     crop: object | None
     crop_vec: list[float] | None
+    # El recorte solo se publica si YOLO ve un vehículo sobre él.
+    publishable: bool = False
+
+
+# Fracción mínima de la caja más pequeña (recorte o vehículo) que debe
+# solaparse para dar el recorte por «es un coche».
+_CAR_OVERLAP = 0.5
+
+
+def _overlap(a, b) -> float:
+    ix = max(0.0, min(a[2], b[2]) - max(a[0], b[0]))
+    iy = max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
+    area = min((a[2] - a[0]) * (a[3] - a[1]), (b[2] - b[0]) * (b[3] - b[1]))
+    return (ix * iy) / area if area > 0 else 0.0
+
+
+def _crop_is_car(im, seg) -> bool:
+    """El recorte (saliencia) es un coche: YOLO detecta un vehículo que se
+    solapa con su caja. Sin YOLO, con error o sin detección → False."""
+    bbox = getattr(seg, "bbox", None)
+    if not bbox:
+        return False
+    from app.services import yolo_crop
+
+    try:
+        boxes = yolo_crop.vehicle_boxes(im)
+    except Exception:  # noqa: BLE001
+        _log.warning("ai_catalog: YOLO falló al validar el recorte", exc_info=True)
+        return False
+    return any(_overlap(b, bbox) >= _CAR_OVERLAP for b in boxes or [])
 
 
 def prepare_image(image_bytes: bytes) -> Prepared:
@@ -574,7 +604,8 @@ def prepare_image(image_bytes: bytes) -> Prepared:
     seg = car_segment.isolate_car(im)
     crop = seg.image if seg is not None else None
     crop_vec = dinov2_embed.embed_image(crop) if crop is not None else None
-    return Prepared(im=im, crop=crop, crop_vec=crop_vec)
+    publishable = crop is not None and _crop_is_car(im, seg)
+    return Prepared(im=im, crop=crop, crop_vec=crop_vec, publishable=publishable)
 
 
 def check_result(chk: DupCheck) -> dict:
@@ -620,7 +651,9 @@ def create_new(db, user_id: str, read: dict, prep: Prepared) -> dict:
     source_id = make_source_id(read)
     vid = piece_id(source_id)
 
-    url = _save_crop(crop) if crop is not None else None
+    # Barrera 5: sin manos ni fondo. Solo se publica un recorte que YOLO
+    # confirma como vehículo; si no, la pieza nace sin foto.
+    url = _save_crop(crop) if crop is not None and prep.publishable else None
     metadata: dict = {"scale": "1/64"}
     if year is not None:
         metadata["year"] = year
