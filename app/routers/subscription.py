@@ -10,6 +10,7 @@ from pymongo.errors import DuplicateKeyError
 
 from app.config import get_settings
 from app.db import get_db
+from app.ratelimit import hit_or_429
 from app.security import CurrentUser, get_current_user
 from app.services import revenuecat, subscription
 
@@ -23,9 +24,14 @@ REVOKE_CANCEL_REASONS = {"CUSTOMER_SUPPORT"}  # reembolso hecho por soporte
 
 @router.post("/sync")
 async def sync(user: CurrentUser = Depends(get_current_user)):
+    hit_or_429("sub-sync", user.id, limit=5, per_seconds=60)
     db = get_db()
-    await asyncio.to_thread(revenuecat.sync_user, db, user.id)
-    return subscription.get_status(db, user.id)
+
+    def _work():
+        revenuecat.sync_user(db, user.id)
+        return subscription.get_status(db, user.id)
+
+    return await asyncio.to_thread(_work)
 
 
 @router.get("/status")
@@ -50,8 +56,10 @@ def _apply(db, ev: dict) -> None:
     last = doc.get("last_event_ts_ms")
     if ts is not None and last is not None and ts < last:
         return  # evento más viejo que el último aplicado
+    # PRODUCT_CHANGE: el producto nuevo viene en new_product_id.
+    product_id = (ev.get("new_product_id") if etype == "PRODUCT_CHANGE" else None) or ev.get("product_id")
     common = dict(
-        product_id=ev.get("product_id"),
+        product_id=product_id,
         store=ev.get("store"),
         event_id=ev.get("id"),
         event_ts_ms=ts,
@@ -62,14 +70,14 @@ def _apply(db, ev: dict) -> None:
     exp = _ms_to_dt(ev.get("expiration_at_ms"))
     if revoke:
         subscription.upsert_subscription(
-            db, uid, premium=False, period=doc.get("period"), expires_at=exp or datetime.now(timezone.utc),
+            db, uid, premium=False, period=doc.get("period"), expires_at=exp or doc.get("expires_at") or datetime.now(timezone.utc),
             will_renew=False, revoked=True, **common,
         )
     elif etype in ACTIVATE:
         if exp is None:
             return  # sin vencimiento no se concede Premium (None = para siempre)
         subscription.upsert_subscription(
-            db, uid, premium=True, period=revenuecat.period_from_product(ev.get("product_id"), exp),
+            db, uid, premium=True, period=revenuecat.period_from_product(product_id, exp),
             expires_at=exp, will_renew=True, **common,
         )
     elif etype == "CANCELLATION":
@@ -80,9 +88,11 @@ def _apply(db, ev: dict) -> None:
                 update["last_event_ts_ms"] = ts
             db.subscriptions.update_one({"user_id": uid}, {"$set": update})
     elif etype == "EXPIRATION":
+        # No apaga premium: is_premium aplica expires_at + gracia.
         subscription.upsert_subscription(
-            db, uid, premium=False, period=doc.get("period"),
-            expires_at=exp or datetime.now(timezone.utc), will_renew=False, **common,
+            db, uid, premium=bool(doc.get("premium", False)), period=doc.get("period"),
+            expires_at=exp or doc.get("expires_at") or datetime.now(timezone.utc),
+            will_renew=False, **common,
         )
     # BILLING_ISSUE y el resto: se mantiene el estado hasta expires_at
 
@@ -101,16 +111,20 @@ async def revenuecat_webhook(request: Request):
     if not isinstance(ev, dict) or not ev.get("id"):
         return {"ok": True}
     db = get_db()
-    try:
-        db.revenuecat_events.insert_one(
-            {"event_id": ev["id"], "type": ev.get("type"), "created_at": datetime.now(timezone.utc)}
-        )
-    except DuplicateKeyError:
-        return {"ok": True, "duplicate": True}
-    try:
-        _apply(db, ev)
-    except Exception:
-        # Libera el id para que el reintento de RevenueCat pueda procesarlo.
-        db.revenuecat_events.delete_one({"event_id": ev["id"]})
-        raise
-    return {"ok": True}
+
+    def _work() -> dict:
+        try:
+            db.revenuecat_events.insert_one(
+                {"event_id": ev["id"], "type": ev.get("type"), "created_at": datetime.now(timezone.utc)}
+            )
+        except DuplicateKeyError:
+            return {"ok": True, "duplicate": True}
+        try:
+            _apply(db, ev)
+        except Exception:
+            # Libera el id para que el reintento de RevenueCat pueda procesarlo.
+            db.revenuecat_events.delete_one({"event_id": ev["id"]})
+            raise
+        return {"ok": True}
+
+    return await asyncio.to_thread(_work)

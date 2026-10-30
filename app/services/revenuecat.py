@@ -12,7 +12,7 @@ from urllib.parse import quote
 import httpx
 
 from app.config import get_settings
-from app.services.subscription import upsert_subscription
+from app.services.subscription import _utc, upsert_subscription
 
 API_URL = "https://api.revenuecat.com/v1/subscribers/"
 ENTITLEMENT = "premium"
@@ -83,7 +83,8 @@ def entitlement_from_subscriber(payload: dict) -> dict | None:
             and not info.get("unsubscribe_detected_at")
         )
         return {
-            "premium": active,
+            # RevenueCat conserva los entitlements vencidos: expires_at + gracia deciden en is_premium.
+            "premium": True,
             "product_id": product_id,
             "period": period_from_product(product_id, expires_at),
             "expires_at": expires_at,
@@ -102,5 +103,12 @@ def sync_user(db, user_id: str) -> bool:
     ent = entitlement_from_subscriber(payload)
     if ent is None:
         return True  # respondió, pero no hay entitlement utilizable: no se toca nada
-    upsert_subscription(db, user_id, event_id=None, **ent)
+    doc = db.subscriptions.find_one({"user_id": user_id}) or {}
+    if doc.get("revoked"):
+        # Tras un reembolso/revocación solo una compra posterior (vencimiento más nuevo) lo repone.
+        prev = doc.get("expires_at")
+        new = ent["expires_at"]
+        if prev is not None and (new is not None and _utc(new) <= _utc(prev)):
+            return True
+    upsert_subscription(db, user_id, event_id=doc.get("last_event_id"), **ent)
     return True

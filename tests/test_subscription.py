@@ -184,7 +184,7 @@ def test_entitlement_from_subscriber_active_and_expired():
     assert act["product_id"] == "curio_pro_monthly" and act["store"] == "play_store"
     assert act["expires_at"] > datetime.now(UTC)
     exp = revenuecat.entitlement_from_subscriber(_payload(past, unsub="2026-09-01T00:00:00Z"))
-    assert exp["premium"] is False and exp["will_renew"] is False
+    assert exp["premium"] is True and exp["will_renew"] is False  # la gracia la decide is_premium
     assert revenuecat.entitlement_from_subscriber(_payload(future, ent=False)) is None
     assert revenuecat.entitlement_from_subscriber({"subscriber": {}}) is None
     # Vitalicio solo si el payload trae expires_date: null de verdad.
@@ -290,3 +290,53 @@ def test_webhook_refund_revokes_without_grace():
     doc = _db.subscriptions.find_one({"user_id": uid})
     assert doc["revoked"] is True and doc["premium"] is False
     assert not sub.is_premium(_db, uid)
+
+
+def _days(n):
+    return (datetime.now(UTC) + timedelta(days=n)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def test_grace_window_after_expiration_webhook_and_sync():
+    uid = "u-w"
+    for ago, expected in ((1, True), (4, False)):
+        _db.subscriptions.delete_many({})
+        _db.revenuecat_events.delete_many({})
+        _post(_ev("RENEWAL", f"g{ago}a", 1000, expiration_at_ms=_ms(datetime.now(UTC) + timedelta(days=30))))
+        _post(_ev("EXPIRATION", f"g{ago}b", 2000, expiration_at_ms=_ms(datetime.now(UTC) - timedelta(days=ago))))
+        assert sub.is_premium(_db, uid) is expected
+        # sync con entitlement ya vencido: mismo resultado
+        _db.subscriptions.delete_many({})
+        with patch.object(revenuecat, "fetch_subscriber", return_value=_payload(_days(-ago))):
+            revenuecat.sync_user(_db, uid)
+        assert sub.is_premium(_db, uid) is expected
+
+
+def test_sync_does_not_restore_revoked_premium():
+    uid = "u-w"
+    end = _days(30)
+    _post(_ev("INITIAL_PURCHASE", "v1", 1000, expiration_at_ms=_ms(revenuecat.parse_date(end))))
+    _post(_ev("CANCELLATION", "v2", 2000, cancel_reason="CUSTOMER_SUPPORT"))
+    assert not sub.is_premium(_db, uid)
+    with patch.object(revenuecat, "fetch_subscriber", return_value=_payload(end)):
+        revenuecat.sync_user(_db, uid)
+    doc = _db.subscriptions.find_one({"user_id": uid})
+    assert doc["revoked"] is True and not sub.is_premium(_db, uid)
+    # Una compra posterior (vencimiento más nuevo que el estado revocado) sí repone.
+    with patch.object(revenuecat, "fetch_subscriber", return_value=_payload(_days(60))):
+        revenuecat.sync_user(_db, uid)
+    assert sub.is_premium(_db, uid)
+
+
+def test_sync_endpoint_is_rate_limited():
+    tok = create_access_token("u-rl", "rl")
+    h = {"Authorization": f"Bearer {tok}"}
+    with patch.object(revenuecat, "fetch_subscriber", return_value=None):
+        codes = [_c.post("/api/v1/subscription/sync", headers=h).status_code for _ in range(6)]
+    assert codes == [200] * 5 + [429]
+
+
+def test_product_change_records_new_product():
+    later = _ms(datetime.now(UTC) + timedelta(days=30))
+    _post(_ev("PRODUCT_CHANGE", "p1", 1000, new_product_id="curio_pro_annual", expiration_at_ms=later))
+    doc = _db.subscriptions.find_one({"user_id": "u-w"})
+    assert doc["product_id"] == "curio_pro_annual" and doc["period"] == "annual"
