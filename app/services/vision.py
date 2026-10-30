@@ -1147,6 +1147,20 @@ def _index_names() -> dict[str, str]:
     return _NAMES[1]
 
 
+# Ids de piezas ocultas (`hidden: true`): nunca salen como coincidencia ni
+# sugerencia. Los fija el router (tiene Mongo); aquí solo se consulta.
+_hidden: frozenset = frozenset()
+
+
+def set_hidden_ids(ids) -> None:
+    global _hidden
+    _hidden = frozenset(str(i) for i in ids)
+
+
+def hidden_ids() -> frozenset:
+    return _hidden
+
+
 def match_embedding(emb: np.ndarray, top_k: int = 8, include_mv: bool = False) -> list[VisionMatch]:
     """Top-k por id. Las vistas multivista (coche aislado sobre blanco) solo se
     consultan con `include_mv=True` — es decir, desde el embed del coche
@@ -1164,9 +1178,10 @@ def match_embedding(emb: np.ndarray, top_k: int = 8, include_mv: bool = False) -
     # mejor puntuación por id para que un producto no acapare el top-k.
     seen: dict[str, float] = {}
     results: list[VisionMatch] = []
+    hid = _hidden
     for i in order:
         iid = index[i]["id"]
-        if iid in seen:
+        if iid in seen or (hid and str(iid) in hid):
             continue
         seen[iid] = float(sims[i])
         results.append(
@@ -1224,7 +1239,7 @@ def search_catalog_by_text(
                 stats["truncated"] = True
             break
         name = e.get("name") or ""
-        if not name:
+        if not name or (_hidden and str(e["id"]) in _hidden):
             continue
         # Prefilter: sin afinidad mínima con el OCR no gastamos el scorer
         # difusivo. Se acepta coincidencia exacta de token O prefijo de 2

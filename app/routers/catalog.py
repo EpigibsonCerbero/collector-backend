@@ -209,7 +209,7 @@ def list_variants(
     `X-Total-Count` para que la UI sepa cuándo parar de paginar.
     """
     db = get_db()
-    match: dict = {}
+    match: dict = {"hidden": {"$ne": True}}
     if rarity:
         match["rarity"] = rarity
     and_clauses: list[dict] = []
@@ -345,7 +345,7 @@ def _master_cache(db) -> dict[str, tuple[str, int | None]]:
 @router.get("/catalog/variants/count")
 def count_variants() -> dict:
     """Total de variantes (para la UI sin tener que paginar)."""
-    return {"total": get_db().variants.count_documents({})}
+    return {"total": get_db().variants.count_documents({"hidden": {"$ne": True}})}
 
 
 @router.get("/catalog/facets")
@@ -473,7 +473,7 @@ def get_variant_by_hash(ai_hash: str) -> ItemVariantOut:
 @router.get("/catalog/variants/by-toy/{toy_number}", response_model=list[ItemVariantOut])
 def get_variants_by_toy(toy_number: str) -> list[ItemVariantOut]:
     db = get_db()
-    docs = list(db.variants.find({"toy_number": toy_number}))
+    docs = list(db.variants.find({"toy_number": toy_number, "hidden": {"$ne": True}}))
     return [_variant_out(d, _load_master(db, d)) for d in docs]
 
 

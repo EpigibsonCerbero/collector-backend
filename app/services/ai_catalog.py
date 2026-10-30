@@ -318,6 +318,10 @@ def check_duplicate(db, read: dict, crop_vec: list[float] | None) -> DupCheck:
     st = get_settings()
 
     def dup(doc: dict, reason: str) -> DupCheck:
+        if doc.get("hidden"):
+            # Pieza oculta por el dueño: ni se devuelve como existente ni se
+            # recrea (el mismo id volvería a pisarla).
+            return DupCheck("uncertain", "hidden_exists")
         return DupCheck("duplicate", reason, _piece_out(doc, _load_master(db, doc), created=False))
 
     doc = _resolve_variant(db, piece_id(make_source_id(read)))
@@ -342,6 +346,7 @@ def check_duplicate(db, read: dict, crop_vec: list[float] | None) -> DupCheck:
 
     same, capped = _same_casting_variants(db, read)
     verdicts = [(_livery_verdict(read, v), v) for v in same]
+    verdicts.sort(key=lambda t: bool(t[1].get("hidden")))  # una visible gana a una oculta
     for verdict, v in verdicts:
         if verdict == "match":
             return dup(v, "same_casting_livery")

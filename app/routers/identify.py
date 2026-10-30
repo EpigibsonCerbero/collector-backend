@@ -29,7 +29,7 @@ from pydantic import BaseModel, Field
 
 from app.config import get_settings
 from app.db import as_id, get_db, oid, serialize, serialize_many
-from app.services import ai_catalog, claude_vision, revenuecat, subscription as subs
+from app.services import ai_catalog, claude_vision, revenuecat, subscription as subs, vision
 from app.services.debug_bus import publish as _dbg
 from app.services.vision import (
     VisionMatch,
@@ -59,9 +59,9 @@ def _livery_hints_for(db, suggestions: list) -> dict[str, str]:
     for s in suggestions[:8]:
         if not s.name:
             continue
-        doc = db.variants.find_one({"variant_name": s.name}, {"livery_desc": 1, "livery_color": 1, "livery_number": 1})
+        doc = db.variants.find_one({"variant_name": s.name, "hidden": {"$ne": True}}, {"livery_desc": 1, "livery_color": 1, "livery_number": 1})
         if not doc and s.id:
-            doc = db.variants.find_one({"_id": s.id}, {"livery_desc": 1, "livery_color": 1, "livery_number": 1})
+            doc = db.variants.find_one({"_id": s.id, "hidden": {"$ne": True}}, {"livery_desc": 1, "livery_color": 1, "livery_number": 1})
         if not doc:
             continue
         bits = [b for b in (doc.get("livery_desc"), doc.get("livery_color"), f"dorsal {doc.get('livery_number')}" if doc.get("livery_number") else None) if b]
@@ -96,12 +96,12 @@ def _apply_livery_score(db, res, image_colors: list[str] | None) -> None:
     ocr_toks = _livery_tokens(text)
     for m in top_n:
         doc = db.variants.find_one(
-            {"_id": m.id},
+            {"_id": m.id, "hidden": {"$ne": True}},
             {"livery_desc": 1, "livery_color": 1, "livery_number": 1, "body_color": 1},
         ) if m.id else None
         if not doc and m.toy:
             doc = db.variants.find_one(
-                {"toy_number": m.toy},
+                {"toy_number": m.toy, "hidden": {"$ne": True}},
                 {"livery_desc": 1, "livery_color": 1, "livery_number": 1, "body_color": 1},
             )
         if not doc:
@@ -234,9 +234,9 @@ def _find_variant_by_id(db, vid: str) -> tuple[dict | None, dict | None]:
         for key in (cand, None):
             try:
                 query = {"_id": as_id(cand)} if key is not None else {"_id": cand}
-                doc = db.variants.find_one(query)
+                doc = db.variants.find_one({**query, "hidden": {"$ne": True}})
             except Exception:  # noqa: BLE001
-                doc = db.variants.find_one({"_id": cand})
+                doc = db.variants.find_one({"_id": cand, "hidden": {"$ne": True}})
             if doc:
                 master = None
                 mid = doc.get("item_master_id")
@@ -250,7 +250,7 @@ def _find_variant_by_id(db, vid: str) -> tuple[dict | None, dict | None]:
 
 
 def _find_variant_by_upc(db, upc: str) -> tuple[dict | None, dict | None]:
-    doc = db.variants.find_one({"sku_upc": upc})
+    doc = db.variants.find_one({"sku_upc": upc, "hidden": {"$ne": True}})
     if not doc:
         return None, None
     master = None
@@ -265,10 +265,10 @@ def _find_variant_by_upc(db, upc: str) -> tuple[dict | None, dict | None]:
 
 def _find_variant_by_toy(db, toy: str) -> tuple[dict | None, dict | None]:
     norm = toy.upper().replace(" ", "")
-    doc = db.variants.find_one({"toy_number": norm})
+    doc = db.variants.find_one({"toy_number": norm, "hidden": {"$ne": True}})
     if not doc:
         # toy_number con espacios / distinta capitalización
-        doc = db.variants.find_one({"toy_number": {"$regex": f"^{norm}$", "$options": "i"}})
+        doc = db.variants.find_one({"toy_number": {"$regex": f"^{norm}$", "$options": "i"}, "hidden": {"$ne": True}})
     if not doc:
         return None, None
     master = None
@@ -291,14 +291,14 @@ def _to_suggestions(matches: list[VisionMatch], db=None) -> list[IdentifySuggest
         if db is not None:
             _t = _time.time()
             doc = db.variants.find_one(
-                {"_id": m.id}, {"main_image_url": 1, "body_color": 1, "images": 1, "variant_name": 1}
+                {"_id": m.id, "hidden": {"$ne": True}}, {"main_image_url": 1, "body_color": 1, "images": 1, "variant_name": 1}
             )
             _ms = int((_time.time() - _t) * 1000)
             if _ms > 150:
                 _dbg("router", f"find_one lento: {_ms} ms (id={str(m.id)[:8]})")
             if not doc and m.toy:
                 doc = db.variants.find_one(
-                    {"toy_number": m.toy}, {"main_image_url": 1, "body_color": 1, "images": 1}
+                    {"toy_number": m.toy, "hidden": {"$ne": True}}, {"main_image_url": 1, "body_color": 1, "images": 1}
                 )
             if doc:
                 img = doc.get("main_image_url") or (doc.get("images") or [None])[0]
@@ -482,7 +482,7 @@ def _name_index(db) -> list[tuple[str, str, str, list[str]]]:
     if _NAME_IDX is None:
         rows = []
         for d in db.variants.find(
-            {"toy_number": {"$regex": "^(MGT|KHMG)"}}, {"variant_name": 1, "toy_number": 1}
+            {"toy_number": {"$regex": "^(MGT|KHMG)"}, "hidden": {"$ne": True}}, {"variant_name": 1, "toy_number": 1}
         ):
             name = d.get("variant_name") or ""
             if len(_name_tokens(name)) >= 2:
@@ -507,8 +507,9 @@ def _best_name_match(db, text: str, mgt_pack: bool) -> tuple[str, str, str, floa
     if len(compact) < 8:
         return None
     scored = []
+    hid = vision.hidden_ids()
     for vid, toy, name, toks in _name_index(db):
-        if not _tok_in(toks[0], compact):
+        if vid in hid or not _tok_in(toks[0], compact):
             continue
         hc, cov, n = _name_hits(name, compact)
         ok = (n >= 3 and cov >= (0.8 if mgt_pack else 0.9)) or (
@@ -579,6 +580,26 @@ async def _run_confirming(db, uid: str, data: bytes, brand):
     return out
 
 
+_HIDDEN_SYNC = {"at": 0.0}
+_HIDDEN_TTL_S = 30.0
+
+
+def _sync_hidden(db) -> None:
+    """Pasa a visión los ids de piezas ocultas (`hidden: true`), con caché de 30 s.
+    Nunca lanza: si Mongo falla se conserva el conjunto anterior."""
+    import time as _t
+
+    now = _t.monotonic()
+    if now - _HIDDEN_SYNC["at"] < _HIDDEN_TTL_S:
+        return
+    try:
+        ids = {str(d["_id"]) for d in db.variants.find({"hidden": True}, {"_id": 1})}
+    except Exception:  # noqa: BLE001
+        return
+    _HIDDEN_SYNC["at"] = now
+    vision.set_hidden_ids(ids)
+
+
 def _run_identify(image_bytes: bytes, brand: str | None = None) -> IdentifyOut:
     if not image_bytes or len(image_bytes) < 100:
         raise HTTPException(status_code=400, detail="Imagen vacía o inválida")
@@ -590,6 +611,7 @@ def _run_identify(image_bytes: bytes, brand: str | None = None) -> IdentifyOut:
         )
 
     _dbg("petición", f"recibidas {len(image_bytes)} bytes — arranca pipeline de visión")
+    _sync_hidden(get_db())
     try:
         res = identify_image(image_bytes, brand_hint=brand)
     except ValueError as exc:
@@ -813,9 +835,9 @@ def _run_identify(image_bytes: bytes, brand: str | None = None) -> IdentifyOut:
         # Último intento: nombre exacto del candidato
         if not doc and top.name:
             _dbg("mongo", f"lookup por nombre {top.name[:50]!r}…")
-            doc2 = db.variants.find_one({"variant_name": top.name})
+            doc2 = db.variants.find_one({"variant_name": top.name, "hidden": {"$ne": True}})
             if not doc2:
-                doc2 = db.variants.find_one({"variant_name": {"$regex": re.escape(top.name[:40]), "$options": "i"}})
+                doc2 = db.variants.find_one({"variant_name": {"$regex": re.escape(top.name[:40]), "$options": "i"}, "hidden": {"$ne": True}})
             if doc2:
                 mid = doc2.get("item_master_id")
                 master = db.items.find_one({"_id": mid}) if mid else None

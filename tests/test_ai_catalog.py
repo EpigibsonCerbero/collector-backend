@@ -1331,3 +1331,180 @@ def test_garage_add_non_ai_no_write_and_confirm_failure_ok(gar, monkeypatch):
     monkeypatch.setattr(aic, "confirm", lambda *a: (_ for _ in ()).throw(RuntimeError("x")))
     r = client.post("/api/v1/garage/items", json={"collection_id": coll, "item_variant_id": "ai1"})
     assert r.status_code == 201
+
+
+# ── Task 7: herramienta de revisión y piezas ocultas ───────────────────────
+
+import importlib.util as _ilu
+from datetime import datetime as _dt7, timedelta as _td7
+
+_spec = _ilu.spec_from_file_location(
+    "review_ai_pieces", Path(__file__).resolve().parents[1] / "scripts" / "review_ai_pieces.py")
+rev = _ilu.module_from_spec(_spec)
+_spec.loader.exec_module(rev)
+
+_NH = {"hidden": {"$ne": True}}
+
+
+@pytest.fixture
+def hid(monkeypatch):
+    for coll in ("variants", "items"):
+        _db[coll].delete_many({})
+    monkeypatch.setattr(_vis, "_hidden", frozenset())
+    monkeypatch.setattr(idn, "_NAME_IDX", None)
+    yield
+    monkeypatch.setattr(_vis, "_hidden", frozenset())
+
+
+def _p7(_id, minutes=0, **kw):
+    d = {"_id": _id, "origin": "ai", "verified": False, "created_by": "u1", "confirmed_by": ["a", "b"][: kw.pop("nconf", 0)],
+         "variant_name": f"Pieza {_id}", "ai_local_hash": "h" + _id, "source_confidence": 0.8,
+         "created_at": _dt7(2026, 10, 1, tzinfo=timezone.utc) + _td7(minutes=minutes)}
+    d.update(kw)
+    _db.variants.insert_one(d)
+
+
+def test_list_pending_filters_and_orders(hid):
+    _p7("old", 0, nconf=1)
+    _p7("new", 10)
+    _p7("ver", 20, verified=True)
+    _p7("hid", 30, hidden=True)
+    _db.variants.insert_one({"_id": "scrape", "variant_name": "x"})
+    rows = rev.list_pending(_db)
+    assert [r["id"] for r in rows] == ["new", "old"]
+    assert rows[1]["confirmed_by"] == 1 and rows[1]["created_by"] == "u1"
+    assert {"name", "brand", "created_at", "source_confidence"} <= set(rows[0])
+    assert len(rev.list_pending(_db, limit=1)) == 1
+
+
+def test_demote_dry_run_does_not_write(hid, capsys):
+    _p7("a1")
+    res = rev.demote(_db, "a1")
+    assert res["applied"] is False and "hidden" not in _db.variants.find_one({"_id": "a1"})
+    assert rev.main(["--demote", "a1"], db=_db) == 0
+    assert "DRY-RUN" in capsys.readouterr().out
+    assert "hidden" not in _db.variants.find_one({"_id": "a1"})
+
+
+def test_demote_apply_hides_piece(hid, capsys):
+    _p7("a1")
+    assert rev.main(["--demote", "a1", "--apply"], db=_db) == 0
+    out = capsys.readouterr().out
+    assert "respaldo" in out.lower()
+    assert _db.variants.find_one({"_id": "a1"})["hidden"] is True
+    assert _db.variants.count_documents({"_id": "a1"}) == 1  # nada se borra
+    assert rev.list_pending(_db) == []
+
+
+def test_demote_refuses_non_ai_piece(hid, capsys):
+    _db.variants.insert_one({"_id": "s1", "variant_name": "x"})
+    _db.variants.insert_one({"_id": "s2", "variant_name": "y", "origin": "scrape"})
+    for pid in ("s1", "s2", "nope"):
+        assert rev.main(["--demote", pid, "--apply"], db=_db) == 1
+    assert "hidden" not in _db.variants.find_one({"_id": "s1"})
+    assert "hidden" not in _db.variants.find_one({"_id": "s2"})
+    assert rev.main(["--apply"], db=_db) == 2
+
+
+def test_cli_prints_table(hid, capsys):
+    _p7("a1")
+    assert rev.main([], db=_db) == 0
+    assert "a1" in capsys.readouterr().out
+
+
+def test_catalog_hides_hidden_but_lookup_by_id_works(hid):
+    _db.items.insert_one({"_id": "m7", "name": "Skyline", "manufacturer": "Mini GT", "release_year": 2023})
+    for i, hd in (("v1", False), ("v2", True)):
+        _p7(i, item_master_id="m7", toy_number="MGT00777", hidden=hd or None, variant_name="Skyline " + i)
+    _catr._MASTER_CACHE["at"] = 0.0
+    resp = _NS(headers={})
+    lst = _catr.list_variants(resp, limit=100, offset=0, brand=None, rarity=None, search=None,
+                              manufacturer=None, sub_brand=None, scale=None, color=None, decade=None,
+                              sort="name", sort_dir="asc")
+    assert [v.id for v in lst] == ["v1"] and resp.headers["X-Total-Count"] == "1"
+    srch = _catr.list_variants(_NS(headers={}), limit=100, offset=0, brand=None, rarity=None, search="Skyline",
+                               manufacturer=None, sub_brand=None, scale=None, color=None, decade=None,
+                               sort="name", sort_dir="asc")
+    assert [v.id for v in srch] == ["v1"]
+    assert [v.id for v in _catr.get_variants_by_toy("MGT00777")] == ["v1"]
+    assert _catr.count_variants() == {"total": 1}
+    assert _catr.get_variant(_catr_id := "v2").id == "v2"  # por id sigue disponible
+
+
+def test_identify_resolution_ignores_hidden(hid):
+    _p7("h1", hidden=True, toy_number="MGT00555", sku_upc="0123456789012", variant_name="Hidden Skyline GT-R R34 Blue")
+    assert idn._find_variant_by_id(_db, "h1") == (None, None)
+    assert idn._find_variant_by_toy(_db, "MGT00555") == (None, None)
+    assert idn._find_variant_by_upc(_db, "0123456789012") == (None, None)
+    assert idn._name_index(_db) == []
+    sug = idn._to_suggestions([_vis.VisionMatch(id="h1", toy="MGT00555", name="n", score=0.9, source="embed")], _db)
+    assert sug[0].image is None and sug[0].body_color is None
+    _p7("v1", toy_number="MGT00556", variant_name="Visible Skyline GT-R R34 Blue")
+    assert idn._find_variant_by_id(_db, "v1")[0]["_id"] == "v1"
+    assert idn._find_variant_by_toy(_db, "MGT00556")[0]["_id"] == "v1"
+
+
+def test_best_name_match_skips_hidden_ids_even_if_cached(hid, monkeypatch):
+    _p7("v1", toy_number="MGT00556", variant_name="Visible Skyline GT-R R34 Blue")
+    text = "MINI GT Visible Skyline GT-R R34 Blue"
+    assert idn._best_name_match(_db, text, True)[0] == "v1"
+    monkeypatch.setattr(_vis, "_hidden", frozenset({"v1"}))  # índice ya en caché
+    assert idn._best_name_match(_db, text, True) is None
+
+
+def test_vision_matches_skip_hidden_ids(vidx, monkeypatch):
+    v = _unit(1000)
+    _vis.live_index_append(_entry(1), v.tolist())
+    assert _vis.match_embedding(v)[0].id == "live1"
+    _vis.set_hidden_ids({"live1"})
+    try:
+        assert all(m.id != "live1" for m in _vis.match_embedding(v))
+        assert all(m.id != "live1" for m in _vis.search_catalog_by_text("Live 1 Big"))
+    finally:
+        _vis.set_hidden_ids(set())
+
+
+def test_sync_hidden_feeds_vision(hid, monkeypatch):
+    _p7("h1", hidden=True)
+    monkeypatch.setitem(idn._HIDDEN_SYNC, "at", 0.0)
+    idn._sync_hidden(_db)
+    try:
+        assert "h1" in _vis.hidden_ids()
+    finally:
+        _vis.set_hidden_ids(set())
+        idn._HIDDEN_SYNC["at"] = 0.0
+
+
+def test_check_duplicate_hidden_is_uncertain(aienv):
+    r = _read(toy_number="MGT00100")
+    _seed_variant()
+    _db.variants.update_one({"_id": "exist1"}, {"$set": {"hidden": True}})
+    # mismo id determinista oculto
+    sid = aic.piece_id(aic.make_source_id(r))
+    _db.variants.insert_one({"_id": sid, "variant_name": "ai", "hidden": True, "origin": "ai"})
+    chk = aic.check_duplicate(_db, r, None)
+    assert chk.outcome == "uncertain" and chk.piece is None
+    _db.variants.delete_one({"_id": sid})
+    chk = aic.check_duplicate(_db, r, None)  # por toy#
+    assert chk.outcome == "uncertain" and chk.piece is None
+    assert aic.find_duplicate(_db, r, None) is None
+
+
+def test_check_duplicate_hidden_via_text_and_embedding(aienv):
+    _seed_variant(toy="MGT09999")
+    _db.variants.update_one({"_id": "exist1"}, {"$set": {"hidden": True}})
+    aienv["text"] = [_vm("exist1", "Nissan Skyline GT-R R34 Bayside Blue", 0.9)]
+    chk = aic.check_duplicate(_db, _read(), None)
+    assert chk.outcome == "uncertain"
+    aienv["text"] = []
+    aienv["match"] = [_vis.VisionMatch(id="exist1", toy=None, name="x", score=0.95, source="embed")]
+    chk = aic.check_duplicate(_db, _read(livery="otra", casting="Otro Coche"), [0.1] * 768)
+    assert chk.outcome == "uncertain"
+
+
+def test_check_duplicate_visible_beats_hidden_twin(aienv):
+    _seed_variant(_id="vis1", toy="MGT09998")
+    _db.variants.insert_one({"_id": "hid1", "item_master_id": "mexist", "variant_name": "Bayside Blue",
+                             "toy_number": "MGT09997", "hidden": True})
+    chk = aic.check_duplicate(_db, _read(), None)
+    assert chk.outcome == "duplicate" and chk.piece["id"] == "vis1"
