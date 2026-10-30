@@ -84,20 +84,24 @@ def upsert_subscription(
     store: str | None,
     event_id: str | None,
     revoked: bool = False,
+    event_ts_ms: int | None = None,
 ) -> None:
+    fields: dict[str, Any] = {
+        "premium": premium,
+        "product_id": product_id,
+        "period": period,
+        "expires_at": expires_at,
+        "will_renew": will_renew,
+        "store": store,
+        "last_event_id": event_id,
+        "revoked": revoked,
+        "updated_at": datetime.now(timezone.utc),
+    }
+    if event_ts_ms is not None:
+        fields["last_event_ts_ms"] = event_ts_ms  # guarda de orden del webhook
     db.subscriptions.update_one(
         {"user_id": user_id},
-        {"$set": {
-            "premium": premium,
-            "product_id": product_id,
-            "period": period,
-            "expires_at": expires_at,
-            "will_renew": will_renew,
-            "store": store,
-            "last_event_id": event_id,
-            "revoked": revoked,
-            "updated_at": datetime.now(timezone.utc),
-        }},
+        {"$set": fields},
         upsert=True,
     )
 

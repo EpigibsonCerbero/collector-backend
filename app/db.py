@@ -87,6 +87,10 @@ def serialize_many(docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 INDEXES: dict[str, list[tuple[list[tuple[str, int]], dict[str, Any]]]] = {
+    "revenuecat_events": [
+        ([("event_id", ASCENDING)], {"unique": True}),
+        ([("created_at", ASCENDING)], {"expireAfterSeconds": 60 * 60 * 24 * 30}),
+    ],
     "users": [
         ([("email", ASCENDING)], {"unique": True}),
         ([("username", ASCENDING)], {"unique": True}),
