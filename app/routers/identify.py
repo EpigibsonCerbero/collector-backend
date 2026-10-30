@@ -1169,6 +1169,10 @@ _NO_VERIFIER = "rejected:no_verifier"
 _RETRYABLE = frozenset({_NO_VERIFIER})
 
 
+def _ms(seconds: float) -> int:
+    return int(round(seconds * 1000))
+
+
 def _read_and_gate(
     data: bytes,
     receipt: dict,
@@ -1176,6 +1180,7 @@ def _read_and_gate(
     db=None,
     uid: str | None = None,
     ai_deadline: float | None = None,
+    timings: dict | None = None,
 ) -> tuple[str | None, dict | None]:
     """(motivo de rechazo o None, lectura). Red, sin CPU: va FUERA de `_IDENTIFY_SLOTS`.
     La barrera del recibo ya pasó antes de llegar aquí (sin coste).
@@ -1186,19 +1191,26 @@ def _read_and_gate(
 
     `ai_deadline` (instante de `_mono()`): deadline compartido por las dos
     llamadas. Por defecto, `_RESOLVE_AI_BUDGET_S` desde ahora.
+
+    `timings` (opcional): recibe `read_ms` y `verify_ms` medidos con `_mono()`.
     """
+    if timings is None:
+        timings = {}
     if ai_deadline is None:
         ai_deadline = _mono() + _RESOLVE_AI_BUDGET_S
     left = ai_deadline - _mono()
     if left < _RESOLVE_MIN_START_S:
         print("[ai-catalog] sin tiempo para la lectura", flush=True)
         return "no_ai", None
+    t_read = _mono()
     try:
         read = claude_vision.read_for_catalog(
             data, timeout_s=max(_RESOLVE_MIN_TIMEOUT_S, left), opts=opts, deadline=ai_deadline
         )
     except Exception:  # noqa: BLE001
         read = None
+    finally:
+        timings["read_ms"] = _ms(_mono() - t_read)
     if read is None:
         return "no_ai", None
     clean = ai_catalog.sanitize_read(read)
@@ -1226,6 +1238,7 @@ def _read_and_gate(
         except Exception:  # noqa: BLE001
             return "rejected:call_cap", read
     verdict = None
+    t_verify = _mono()
     try:
         verdict = claude_vision.verify_real_object(
             data,
@@ -1235,6 +1248,8 @@ def _read_and_gate(
         )
     except Exception:  # noqa: BLE001
         verdict = None
+    finally:
+        timings["verify_ms"] = _ms(_mono() - t_verify)
     if verdict is None:
         # Sin segunda opinión (error, timeout, corte abierto, sin clave) NO se
         # crea, ni con lectura «alto». Fallo transitorio: el recibo no se marca.
@@ -1437,8 +1452,9 @@ async def identify_resolve_new(
         return IdentifyOut()
     # La lectura espera a la red: fuera del semáforo para no frenar los identify.
     # Modelo/velocidad/pensamiento: los fija el servidor (entorno), no el cliente.
+    timings: dict = {}
     decision, read = await asyncio.to_thread(
-        _read_and_gate, data, receipt, None, db, uid, ai_deadline
+        _read_and_gate, data, receipt, None, db, uid, ai_deadline, timings
     )
     piece = None
     if decision is None:
@@ -1447,10 +1463,18 @@ async def identify_resolve_new(
             print("[ai-catalog] rechazo timeout (sin presupuesto para el alta)", flush=True)
             decision = "rejected:timeout"
         else:
+            t_create = _mono()
             decision, piece = await _create_piece(db, uid, read, data, receipt, total_deadline)
+            timings["create_ms"] = _ms(_mono() - t_create)
     if read is not None and piece is None and decision not in _RETRYABLE and decision != _CREATE_TIMEOUT:
         await asyncio.to_thread(_mark_ai_tried, db, receipt)
     _log.info("ai_catalog %s user=%s", decision, uid)
+    # Latencias reales (sin texto del modelo ni ids de foto) para calibrar los presupuestos.
+    _log.info(
+        "ai_catalog timing read_ms=%s verify_ms=%s create_ms=%s total_ms=%d decision=%s user=%s",
+        timings.get("read_ms", "-"), timings.get("verify_ms", "-"), timings.get("create_ms", "-"),
+        _ms(_mono() - t0), decision, uid,
+    )
     if piece is None:
         return IdentifyOut()
     return IdentifyOut(method="o", confidence=0.95, needs_manual=False, item=piece)

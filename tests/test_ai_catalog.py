@@ -997,7 +997,8 @@ def test_success_returns_item_without_internal_flags(rn, caplog):
     _IVO(**item)  # mismo contrato que el item del identify
     assert _db.ai_catalog_usage.find_one({"user_id": "u1"})["count"] == 1
     assert len(rn["calls"]) == 1
-    msgs = [rec.getMessage() for rec in caplog.records if "ai_catalog" in rec.getMessage()]
+    msgs = [rec.getMessage() for rec in caplog.records
+            if "ai_catalog" in rec.getMessage() and not rec.getMessage().startswith("ai_catalog timing")]
     assert msgs == ["ai_catalog created user=u1"]
 
 
@@ -3097,3 +3098,33 @@ def test_q1_retry_after_clock_timeout_creates(rn, aienv, clk, monkeypatch):
     j = _post().json()
     assert j["method"] == "o" and _rows() == 1
     assert _db.identify_receipts.count_documents({}) == 0
+
+
+# Q5: una línea de tiempos medidos por decisión (sin texto del modelo).
+
+
+def _timing_lines(caplog):
+    return [r.getMessage() for r in caplog.records if r.getMessage().startswith("ai_catalog timing")]
+
+
+def test_q5_timing_line_created(rn, aienv, clk, monkeypatch, caplog):
+    rn["read"] = _read(texto="TEXTO-DEL-MODELO Nissan Skyline GT-R R34")
+    _timed_ai(rn, clk, monkeypatch, read_s=3.0, verify_s=1.5)
+    _slow(clk, monkeypatch, "prepare_image", 0.5)
+    _slow(clk, monkeypatch, "create_new", 0.25)
+    _receipt()
+    with caplog.at_level(_logging.INFO, logger=idn._log.name):
+        assert _post().json()["method"] == "o"
+    lines = _timing_lines(caplog)
+    assert lines == ["ai_catalog timing read_ms=3000 verify_ms=1500 create_ms=750 "
+                     "total_ms=5250 decision=created user=u1"]
+    assert "TEXTO-DEL-MODELO" not in caplog.text
+
+
+def test_q5_timing_line_rejected_without_verify_or_create(rn, aienv, clk, monkeypatch, caplog):
+    _timed_ai(rn, clk, monkeypatch, read_s=8.0)  # sin tiempo para verificar
+    _receipt()
+    with caplog.at_level(_logging.INFO, logger=idn._log.name):
+        assert _is_manual(_post().json())
+    assert _timing_lines(caplog) == ["ai_catalog timing read_ms=8000 verify_ms=- create_ms=- "
+                                     "total_ms=8000 decision=rejected:no_verifier user=u1"]
