@@ -1981,3 +1981,56 @@ def test_vehicle_boxes_filters_classes_and_fails_closed(monkeypatch):
     assert _yolo.vehicle_boxes(img) == [(1, 2, 30, 20), (3, 3, 9, 9)]
     monkeypatch.setattr(_yolo, "_get_yolo", lambda: (_ for _ in ()).throw(ImportError("no ultralytics")))
     assert _yolo.vehicle_boxes(img) is None
+
+
+# ── Revisión final I8: la pieza oficial gana a la de IA con el mismo toy# ───
+
+
+def test_toy_lookups_prefer_official_over_ai(hid):
+    _db.items.insert_one({"_id": "m8", "name": "GT-R", "manufacturer": "Mini GT", "release_year": 2023})
+    _p7("ai8", toy_number="MGT00888", item_master_id="m8", main_image_url=None, body_color="azul",
+        livery_number="23")
+    _db.variants.insert_one({"_id": "off8", "variant_name": "GT-R Oficial", "toy_number": "MGT00888",
+                             "item_master_id": "m8", "ai_local_hash": "hoff8",
+                             "main_image_url": "https://img/oficial.jpg", "body_color": "rojo",
+                             "livery_number": "80"})
+    doc, master = idn._find_variant_by_toy(_db, "MGT00888")
+    assert doc["_id"] == "off8" and master["_id"] == "m8"
+    assert idn._find_variant_by_toy(_db, "mgt00888")[0]["_id"] == "off8"
+    sug = idn._to_suggestions([_vis.VisionMatch(id="nope", toy="MGT00888", name="n", score=0.9, source="embed")], _db)
+    assert sug[0].image == "https://img/oficial.jpg" and sug[0].body_color == "rojo"
+    assert idn._find_one_by_toy(_db, {"toy_number": "MGT00888"}, {"livery_number": 1})["livery_number"] == "80"
+    # sin oficial, la de IA sigue resolviendo
+    _db.variants.delete_one({"_id": "off8"})
+    assert idn._find_variant_by_toy(_db, "MGT00888")[0]["_id"] == "ai8"
+
+
+def _reconcile_seed():
+    _p7("aiA", toy_number="MGT00700")  # tiene oficial → se oculta
+    _p7("aiB", toy_number="MGT00701")  # sin oficial → se queda
+    _p7("aiC", toy_number="MGT00702", hidden=True)  # ya oculta → no se lista
+    _p7("aiD")  # sin toy#
+    _db.variants.insert_one({"_id": "offA", "variant_name": "x", "toy_number": "MGT00700"})
+    _db.variants.insert_one({"_id": "offC", "variant_name": "y", "toy_number": "MGT00702"})
+
+
+def test_reconcile_lists_and_dry_run_writes_nothing(hid, capsys):
+    _reconcile_seed()
+    rows = rev.find_reconcilable(_db)
+    assert [(r["id"], r["official_id"]) for r in rows] == [("aiA", "offA")]
+    assert rev.main(["--reconcile"], db=_db) == 0
+    out = capsys.readouterr().out
+    assert "DRY-RUN" in out and "aiA" in out and "respaldo" in out.lower()
+    assert "hidden" not in _db.variants.find_one({"_id": "aiA"})
+
+
+def test_reconcile_apply_hides_ai_row_only(hid, capsys):
+    _reconcile_seed()
+    n = _db.variants.count_documents({})
+    assert rev.main(["--reconcile", "--apply"], db=_db) == 0
+    assert "respaldo" in capsys.readouterr().out.lower()
+    assert _db.variants.find_one({"_id": "aiA"})["hidden"] is True
+    assert "hidden" not in _db.variants.find_one({"_id": "offA"})
+    assert "hidden" not in _db.variants.find_one({"_id": "aiB"})
+    assert _db.variants.count_documents({}) == n  # nunca borra
+    assert rev.find_reconcilable(_db) == []

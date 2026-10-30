@@ -100,8 +100,8 @@ def _apply_livery_score(db, res, image_colors: list[str] | None) -> None:
             {"livery_desc": 1, "livery_color": 1, "livery_number": 1, "body_color": 1},
         ) if m.id else None
         if not doc and m.toy:
-            doc = db.variants.find_one(
-                {"toy_number": m.toy, "hidden": {"$ne": True}},
+            doc = _find_one_by_toy(
+                db, {"toy_number": m.toy},
                 {"livery_desc": 1, "livery_color": 1, "livery_number": 1, "body_color": 1},
             )
         if not doc:
@@ -263,12 +263,23 @@ def _find_variant_by_upc(db, upc: str) -> tuple[dict | None, dict | None]:
     return doc, master
 
 
+def _find_one_by_toy(db, query: dict, projection: dict | None = None) -> dict | None:
+    """Como `find_one` sobre un toy#, pero si varias piezas lo comparten (una
+    oficial del scrape y una de IA anterior) gana la que no es de IA."""
+    q = {**query, "hidden": {"$ne": True}}
+    proj = {**projection, "origin": 1} if projection else None
+    docs = list(db.variants.find(q, proj).limit(10))
+    if not docs:
+        return None
+    return next((d for d in docs if d.get("origin") != "ai"), docs[0])
+
+
 def _find_variant_by_toy(db, toy: str) -> tuple[dict | None, dict | None]:
     norm = toy.upper().replace(" ", "")
-    doc = db.variants.find_one({"toy_number": norm, "hidden": {"$ne": True}})
+    doc = _find_one_by_toy(db, {"toy_number": norm})
     if not doc:
         # toy_number con espacios / distinta capitalización
-        doc = db.variants.find_one({"toy_number": {"$regex": f"^{norm}$", "$options": "i"}, "hidden": {"$ne": True}})
+        doc = _find_one_by_toy(db, {"toy_number": {"$regex": f"^{re.escape(norm)}$", "$options": "i"}})
     if not doc:
         return None, None
     master = None
@@ -297,9 +308,7 @@ def _to_suggestions(matches: list[VisionMatch], db=None) -> list[IdentifySuggest
             if _ms > 150:
                 _dbg("router", f"find_one lento: {_ms} ms (id={str(m.id)[:8]})")
             if not doc and m.toy:
-                doc = db.variants.find_one(
-                    {"toy_number": m.toy, "hidden": {"$ne": True}}, {"main_image_url": 1, "body_color": 1, "images": 1}
-                )
+                doc = _find_one_by_toy(db, {"toy_number": m.toy}, {"main_image_url": 1, "body_color": 1, "images": 1})
             if doc:
                 img = doc.get("main_image_url") or (doc.get("images") or [None])[0]
                 color = doc.get("body_color")
