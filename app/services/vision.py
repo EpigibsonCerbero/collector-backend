@@ -121,7 +121,8 @@ def _index_signature(paths: list[Path]) -> tuple:
     return tuple(sig)
 
 
-def get_index() -> tuple[list[dict], np.ndarray]:
+def _get_big_index() -> tuple[list[dict], np.ndarray]:
+    """Índice grande (JSON/.npy). Solo se recarga si cambia SU firma."""
     global _index, _matrix, _index_sig
     paths = _index_paths()
     sig = _index_signature(paths)
@@ -188,6 +189,125 @@ def get_index() -> tuple[list[dict], np.ndarray]:
         except Exception as exc:  # noqa: BLE001
             print(f"[vision] no se pudo cachear .npy: {exc}", flush=True)
     return _index, _matrix
+
+
+# ── Índice VIVO ─────────────────────────────────────────────────────────────
+# Piezas creadas por IA se añaden a un archivo pequeño aparte (no al de 200 MB,
+# cuya firma provocaría un reload de 3-8 s). get_index() devuelve grande + vivo.
+_live_lock = threading.RLock()
+_live_meta: list[dict] = []
+_live_mat: np.ndarray | None = None
+_live_sig: tuple | None = None
+_live_version = 0
+_merged: tuple | None = None  # (id(grande), live_version, entries, matrix)
+
+
+def _live_path() -> Path:
+    return Path(os.environ.get("EMB_LIVE_PATH", str(ROOT / "data" / "live-embeddings.json")))
+
+
+def _live_reset() -> None:
+    """Borra el estado vivo en memoria (el archivo no se toca)."""
+    global _live_meta, _live_mat, _live_sig, _live_version, _merged
+    with _live_lock:
+        _live_meta, _live_mat, _live_sig, _merged = [], None, None, None
+        _live_version += 1
+
+
+def _read_live_file(path: Path) -> tuple[list[dict], np.ndarray | None]:
+    rows = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(rows, list):
+        raise ValueError("live index no es una lista")
+    meta = [{k: r.get(k) for k in ("id", "toy", "name", "view")} for r in rows]
+    if not rows:
+        return meta, None
+    mat = np.array([r["vec"] for r in rows], dtype=np.float32)
+    n = np.linalg.norm(mat, axis=1, keepdims=True)
+    n[n == 0] = 1.0
+    return meta, mat / n
+
+
+def _live_refresh() -> None:
+    """Recarga SOLO el archivo vivo si su firma cambió. Nunca lanza."""
+    global _live_meta, _live_mat, _live_sig, _live_version, _merged
+    path = _live_path()
+    sig = _index_signature([path])
+    if sig == _live_sig:
+        return
+    with _live_lock:
+        sig = _index_signature([path])
+        if sig == _live_sig:
+            return
+        meta, mat = [], None
+        if sig[0][1] is not None:
+            try:
+                meta, mat = _read_live_file(path)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[vision] índice vivo ilegible, se ignora: {exc}", flush=True)
+                meta, mat = [], None
+        _live_meta, _live_mat, _live_sig = meta, mat, sig
+        _live_version += 1
+        _merged = None
+
+
+def get_index() -> tuple[list[dict], np.ndarray]:
+    """Índice grande + entradas vivas. El grande no se reparsea al añadir."""
+    global _merged
+    big, bmat = _get_big_index()
+    _live_refresh()
+    if _live_mat is None:
+        return big, bmat
+    m = _merged
+    if m is not None and m[0] == id(big) and m[1] == _live_version and m[4] is bmat:
+        return m[2], m[3]
+    with _live_lock:
+        if _live_mat is None or _live_mat.shape[1] != bmat.shape[1]:
+            return big, bmat
+        entries = big + _live_meta
+        matrix = np.concatenate([bmat, _live_mat], axis=0)
+        _merged = (id(big), _live_version, entries, matrix, bmat)
+        return entries, matrix
+
+
+def live_index_append(entry: dict, vec: list[float]) -> None:
+    """Añade una entrada al índice vivo: archivo atómico y luego memoria.
+
+    `entry`: id, toy, name, view (view>=20 = coche aislado, solo include_mv).
+    Lanza ValueError si la dimensión no coincide; OSError si falla la escritura
+    (en ambos casos la memoria queda intacta)."""
+    global _live_meta, _live_mat, _live_sig, _live_version, _merged
+    v = np.asarray(vec, dtype=np.float32).ravel()
+    _, bmat = _get_big_index()
+    if v.shape[0] != bmat.shape[1] or not np.isfinite(v).all():
+        raise ValueError(f"dimensión de embedding inválida: {v.shape[0]} != {bmat.shape[1]}")
+    n = float(np.linalg.norm(v))
+    if n == 0:
+        raise ValueError("embedding nulo")
+    v = v / n
+    meta_row = {k: entry.get(k) for k in ("id", "toy", "name", "view")}
+    meta_row["view"] = int(meta_row.get("view") or 0)
+    path = _live_path()
+    with _live_lock:
+        _live_refresh()  # no pisar lo que haya escrito otro worker
+        cur = _live_mat if _live_mat is not None else np.zeros((0, v.shape[0]), dtype=np.float32)
+        new_meta = _live_meta + [meta_row]
+        new_mat = np.concatenate([cur, v[None, :]], axis=0)
+        rows = [{**m, "vec": new_mat[i].tolist()} for i, m in enumerate(new_meta)]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+        try:
+            tmp.write_text(json.dumps(rows, ensure_ascii=False), encoding="utf-8")
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            raise
+        _live_meta, _live_mat = new_meta, new_mat
+        _live_sig = _index_signature([path])
+        _live_version += 1
+        _merged = None
 
 
 # ── Preprocess (idéntico a scripts/gen_dnn_embeddings.py) ───────────────────
@@ -954,14 +1074,14 @@ def embed_image(im) -> np.ndarray | None:
         return None
 
 
-_MV_MASK: tuple[int, np.ndarray] | None = None
+_MV_MASK: tuple[tuple[int, int], np.ndarray] | None = None
 
 
 def _mv_rows(index: list[dict]) -> np.ndarray:
     """True en las vistas MULTIVISTA (view ≥ 20: coche aislado de la galería)."""
     global _MV_MASK
-    if _MV_MASK is None or _MV_MASK[0] != id(index):
-        _MV_MASK = (id(index), np.array([int(e.get("view") or 0) >= 20 for e in index]))
+    if _MV_MASK is None or _MV_MASK[0] != (id(index), len(index)):
+        _MV_MASK = ((id(index), len(index)), np.array([int(e.get("view") or 0) >= 20 for e in index]))
     return _MV_MASK[1]
 
 
@@ -1016,14 +1136,14 @@ def match_mgt_gallery(emb: np.ndarray, top_k: int = 8) -> list[VisionMatch]:
     return out
 
 
-_NAMES: tuple[int, dict[str, str]] | None = None
+_NAMES: tuple[tuple[int, int], dict[str, str]] | None = None
 
 
 def _index_names() -> dict[str, str]:
     global _NAMES
     index, _ = get_index()
-    if _NAMES is None or _NAMES[0] != id(index):
-        _NAMES = (id(index), {str(e["id"]): (e.get("name") or "") for e in index})
+    if _NAMES is None or _NAMES[0] != (id(index), len(index)):
+        _NAMES = ((id(index), len(index)), {str(e["id"]): (e.get("name") or "") for e in index})
     return _NAMES[1]
 
 

@@ -239,3 +239,148 @@ def test_breaker_logs_once(cvenv, capsys):
     cv.read_for_catalog(b"b")
     cv.read_packaging_with_claude(b"c")
     assert capsys.readouterr().out.count("breaker abierto") == 1
+
+
+# ── Task 4: índice visual vivo ─────────────────────────────────────────────
+import time as _time
+
+import numpy as _np
+
+from app.services import vision as _vis
+
+_DIM = 768
+
+
+def _unit(seed):
+    v = _np.random.default_rng(seed).standard_normal(_DIM).astype(_np.float32)
+    return v / _np.linalg.norm(v)
+
+
+@pytest.fixture
+def vidx(tmp_path, monkeypatch):
+    """Índice grande sintético (30 vectores) + archivo vivo en tmp."""
+    big = tmp_path / "big.json"
+    rows = [
+        {"id": f"b{i}", "toy": f"MGT{i:05d}", "name": f"Big {i}", "view": 0, "vec": _unit(i).tolist()}
+        for i in range(30)
+    ]
+    big.write_text(_json.dumps(rows), encoding="utf-8")
+    monkeypatch.setattr(_vis, "DINOV2_INDEX", big)
+    monkeypatch.setenv("EMB_LIVE_PATH", str(tmp_path / "live.json"))
+    for name, val in (("_index", None), ("_matrix", None), ("_index_sig", None)):
+        monkeypatch.setattr(_vis, name, val)
+    _vis._live_reset()
+    yield tmp_path
+    _vis._live_reset()
+
+
+def _entry(i, view=0):
+    return {"id": f"live{i}", "toy": f"AI{i}", "name": f"Live {i}", "view": view}
+
+
+def test_live_append_visible_in_match_embedding(vidx):
+    v = _unit(1000)
+    _vis.live_index_append(_entry(1), v.tolist())
+    near = v + 0.01 * _unit(1001)
+    res = _vis.match_embedding(near / _np.linalg.norm(near))
+    assert res[0].id == "live1" and res[0].score > 0.99
+
+
+def test_live_mv_entry_only_with_include_mv(vidx):
+    v = _unit(1002)
+    _vis.live_index_append(_entry(2, view=20), v.tolist())
+    assert "live2" not in [m.id for m in _vis.match_embedding(v)]
+    assert _vis.match_embedding(v, include_mv=True)[0].id == "live2"
+
+
+def test_live_append_does_not_reload_big_index(vidx, monkeypatch):
+    idx, mat = _vis.get_index()
+    big_sig = _vis._index_sig
+    loads = []
+    real = _json.loads
+    monkeypatch.setattr(_vis.json, "loads", lambda *a, **k: (loads.append(1), real(*a, **k))[1])
+    _vis.live_index_append(_entry(3), _unit(1003).tolist())
+    idx2, mat2 = _vis.get_index()
+    assert _vis._index_sig == big_sig
+    assert _vis._index is idx  # grande intacto, sin reparsear
+    assert len(idx2) == len(idx) + 1 and mat2.shape[0] == mat.shape[0] + 1
+    assert _vis.get_index()[0] is idx2  # fusionado cacheado
+    assert loads == []
+
+
+def test_live_index_persists_across_reload(vidx):
+    v = _unit(1004)
+    _vis.live_index_append(_entry(4), v.tolist())
+    _vis._live_reset()  # borra el estado en memoria
+    assert _vis.match_embedding(v)[0].id == "live4"
+
+
+def test_live_file_change_reloads_only_live(vidx):
+    _vis.get_index()
+    other = [{**_entry(5), "vec": _unit(1005).tolist()}]
+    (vidx / "live.json").write_text(_json.dumps(other), encoding="utf-8")
+    assert _vis.match_embedding(_unit(1005))[0].id == "live5"
+
+
+def test_live_corrupt_file_does_not_break_index(vidx):
+    (vidx / "live.json").write_text("{not json", encoding="utf-8")
+    idx, mat = _vis.get_index()
+    assert len(idx) == 30
+
+
+def test_live_append_atomic_on_failure(vidx, monkeypatch):
+    _vis.live_index_append(_entry(6), _unit(1006).tolist())
+    before = _vis.get_index()
+    disk = (vidx / "live.json").read_text()
+
+    def boom(*a, **k):
+        raise OSError("disk full")
+
+    with monkeypatch.context() as mp:
+        mp.setattr(_vis.os, "replace", boom)
+        with pytest.raises(OSError):
+            _vis.live_index_append(_entry(7), _unit(1007).tolist())
+    after = _vis.get_index()
+    assert len(after[0]) == len(before[0]) == 31
+    assert (vidx / "live.json").read_text() == disk
+    assert [p.name for p in vidx.iterdir() if p.name.startswith("live") and p.name != "live.json"] == []
+
+
+def test_live_dim_mismatch_rejected(vidx):
+    _vis.get_index()
+    with pytest.raises(ValueError):
+        _vis.live_index_append(_entry(8), [0.1] * 10)
+    assert len(_vis.get_index()[0]) == 30
+    assert not (vidx / "live.json").exists()
+
+
+def test_live_vector_is_l2_normalized(vidx):
+    v = _unit(1009) * 5.0
+    _vis.live_index_append(_entry(9), v.tolist())
+    _, mat = _vis.get_index()
+    assert abs(float(_np.linalg.norm(mat[-1])) - 1.0) < 1e-5
+
+
+def test_match_identical_without_live(vidx):
+    q = _unit(3)
+    res = _vis.match_embedding(q)
+    assert res[0].id == "b3" and abs(res[0].score - 1.0) < 1e-5
+
+
+def test_live_perf_overhead_100_entries(vidx):
+    q = _unit(77)
+    _vis.match_embedding(q)
+
+    def t():
+        s = _time.perf_counter()
+        for _ in range(200):
+            _vis.match_embedding(q)
+        return (_time.perf_counter() - s) / 200 * 1000
+
+    base = t()
+    for i in range(100):
+        _vis.live_index_append(_entry(100 + i), _unit(2000 + i).tolist())
+    _vis.match_embedding(q)
+    with_live = t()
+    print(f"\nmatch_embedding base={base:.3f}ms live100={with_live:.3f}ms delta={with_live-base:.3f}ms")
+    assert with_live - base < 5.0
