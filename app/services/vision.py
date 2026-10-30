@@ -652,7 +652,7 @@ def inject_race_num_candidates(
     for e in index:
         name = e.get("name") or ""
         nn = _name_race_num(name)
-        if not nn or nn not in nums or e.get("id") in have:
+        if not nn or nn not in nums or e.get("id") in have or (_hidden and str(e.get("id")) in _hidden):
             continue
         if _name_family(name) != ref_family:
             continue  # otra familia de casting → no inyectar

@@ -1508,3 +1508,46 @@ def test_check_duplicate_visible_beats_hidden_twin(aienv):
                              "toy_number": "MGT09997", "hidden": True})
     chk = aic.check_duplicate(_db, _read(), None)
     assert chk.outcome == "duplicate" and chk.piece["id"] == "vis1"
+
+
+# ── Task 7 fix round 1 ─────────────────────────────────────────────────────
+
+
+def test_inject_race_num_skips_hidden_and_not_suggested(vidx):
+    base = {"id": "b0", "toy": "MGT00001", "name": "Dino Rexy #77", "view": 0}
+    _vis.live_index_append(base, _unit(2000).tolist())
+    _vis.live_index_append({"id": "hid80", "toy": "AI80", "name": "Dino Rexy #80", "view": 0},
+                           _unit(2001).tolist())
+    pool = [_vis.VisionMatch(id="b0", toy="MGT00001", name="Dino Rexy #77", score=0.9, source="embed")]
+    out = _vis.inject_race_num_candidates(list(pool), "texto #80", top_n=6)
+    assert sorted(m.id for m in out) == ["b0", "hid80"]  # control: sin ocultar se inyecta
+    _vis.set_hidden_ids({"hid80"})
+    try:
+        out = _vis.inject_race_num_candidates(list(pool), "texto #80", top_n=6)
+        assert [m.id for m in out] == ["b0"]
+        sug = idn._to_suggestions(out, _db)
+        assert all(s.id != "hid80" and "#80" not in (s.name or "") for s in sug)
+    finally:
+        _vis.set_hidden_ids(set())
+
+
+def test_sync_hidden_failure_keeps_set_and_does_not_retry(hid, monkeypatch):
+    _vis.set_hidden_ids({"keep1"})
+    monkeypatch.setitem(idn._HIDDEN_SYNC, "at", 0.0)
+    calls = []
+
+    class Boom:
+        class variants:
+            @staticmethod
+            def find(*a, **k):
+                calls.append(1)
+                raise RuntimeError("mongo caido")
+
+    try:
+        idn._sync_hidden(Boom)
+        idn._sync_hidden(Boom)  # dentro de la ventana: no consulta otra vez
+        assert len(calls) == 1
+        assert "keep1" in _vis.hidden_ids()
+    finally:
+        _vis.set_hidden_ids(set())
+        idn._HIDDEN_SYNC["at"] = 0.0

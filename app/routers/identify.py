@@ -592,11 +592,11 @@ def _sync_hidden(db) -> None:
     now = _t.monotonic()
     if now - _HIDDEN_SYNC["at"] < _HIDDEN_TTL_S:
         return
+    _HIDDEN_SYNC["at"] = now  # también al fallar: sin reintentos por petición
     try:
         ids = {str(d["_id"]) for d in db.variants.find({"hidden": True}, {"_id": 1})}
     except Exception:  # noqa: BLE001
-        return
-    _HIDDEN_SYNC["at"] = now
+        return  # se conserva el conjunto anterior
     vision.set_hidden_ids(ids)
 
 
