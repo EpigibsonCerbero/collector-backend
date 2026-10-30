@@ -132,6 +132,7 @@ def cvenv(monkeypatch):
     cv._cat_cache.clear()
     getattr(cv, "_logged", set()).clear()
     cv._breaker_reset()
+    getattr(cv, "_style_omit", {}).clear()
     calls = []
     state = {"resp": _ok({})}
 
@@ -2587,3 +2588,77 @@ def test_p2_retry_after_verifier_failure_can_create(rn, monkeypatch):
         "fisico": True, "texto_leido": "MOON EQUIPMENT CO. PANDEM", "casting_leido": "AlphaTauri F1",
         "year_leido": None, "detalle": "ok"})
     assert _post().json()["method"] == "o"
+
+
+# P4: tras un 400 de estilo, el modelo deja de recibir esa clave (TTL 1 h).
+
+_THINK_400 = {"type": "error", "error": {"type": "invalid_request_error",
+              "message": "To turn thinking off on this model, send ..."}}
+
+
+@pytest.fixture
+def style(cvenv, monkeypatch):
+    calls, _st = cvenv
+    queue = []
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(cv, "_now", lambda: clock["t"])
+    cv._style_omit.clear()
+
+    def post(*a, **k):
+        calls.append(k)
+        return queue.pop(0) if queue else _ok({"titulo": "x"})
+
+    monkeypatch.setattr(cv.requests, "post", post)
+    yield calls, queue, clock
+    cv._style_omit.clear()
+
+
+def _gen(img, model="m-x"):
+    return cv.analyze(img, mode="general", opts=cv.CallOpts(model=model, thinking="off"))
+
+
+def test_p4_first_style_400_retries_then_learns(style):
+    calls, queue, _clock = style
+    queue += [_Resp(400, _THINK_400), _ok({"titulo": "a"})]
+    assert _gen(b"p4-1")["titulo"] == "a"
+    assert len(calls) == 2 and "thinking" in calls[0]["json"] and "thinking" not in calls[1]["json"]
+    calls.clear()
+    assert _gen(b"p4-2")["titulo"] == "x"
+    assert len(calls) == 1 and "thinking" not in calls[0]["json"]
+
+
+def test_p4_other_model_does_not_inherit(style):
+    calls, queue, _clock = style
+    queue += [_Resp(400, _THINK_400), _ok({"titulo": "a"})]
+    _gen(b"p4-3", model="m-x")
+    calls.clear()
+    _gen(b"p4-4", model="m-y")
+    assert len(calls) == 1 and calls[0]["json"]["thinking"] == {"type": "disabled"}
+
+
+def test_p4_learned_omission_expires_after_ttl(style):
+    calls, queue, clock = style
+    queue += [_Resp(400, _THINK_400), _ok({"titulo": "a"})]
+    _gen(b"p4-5")
+    clock["t"] += 3599
+    calls.clear()
+    _gen(b"p4-6")
+    assert "thinking" not in calls[0]["json"]
+    clock["t"] += 2
+    calls.clear()
+    _gen(b"p4-7")
+    assert calls[0]["json"]["thinking"] == {"type": "disabled"}
+
+
+def test_p4_no_complaint_sends_style_unchanged(style):
+    calls, _queue, _clock = style
+    _gen(b"p4-8")
+    _gen(b"p4-9")
+    assert all(c["json"]["thinking"] == {"type": "disabled"} for c in calls) and len(calls) == 2
+
+
+def test_p4_overload_429_does_not_learn(style):
+    calls, queue, _clock = style
+    queue += [_Resp(429, {"error": {"message": "fast mode rate limit"}}), _ok({"titulo": "a"})]
+    cv.analyze(b"p4-10", mode="general", opts=cv.CallOpts(model="m-x", speed="fast", thinking="off"))
+    assert cv._style_omit == {}

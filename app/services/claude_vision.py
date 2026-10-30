@@ -308,6 +308,36 @@ def _strip_offending_style(body: dict, err_text: str) -> dict | None:
     return None
 
 
+# Claves de estilo que un modelo rechazó con un 400: no se vuelven a enviar a
+# ese modelo durante `_STYLE_OMIT_TTL_S` (ahorra un viaje por llamada). Solo se
+# aprende de un 400 de estilo; nunca se cambia lo que la API acepta.
+_STYLE_KEYS = ("speed", "thinking", "output_config")
+_STYLE_OMIT_TTL_S = float(os.environ.get("CLAUDE_STYLE_OMIT_TTL_S", "3600"))
+_style_lock = threading.Lock()
+_style_omit: dict[str, tuple[frozenset[str], float]] = {}
+
+
+def _learned_omit(model: str) -> frozenset[str]:
+    with _style_lock:
+        entry = _style_omit.get(model)
+        if entry is None:
+            return frozenset()
+        keys, until = entry
+        if _now() >= until:
+            _style_omit.pop(model, None)
+            return frozenset()
+        return keys
+
+
+def _learn_omit(model: str, keys: set[str]) -> None:
+    if not keys:
+        return
+    with _style_lock:
+        prev = _style_omit.get(model)
+        old = prev[0] if prev and _now() < prev[1] else frozenset()
+        _style_omit[model] = (old | frozenset(keys), _now() + _STYLE_OMIT_TTL_S)
+
+
 def _call(
     image_bytes: bytes,
     prompt: str,
@@ -343,6 +373,11 @@ def _call(
     try:
         b64, media = _prepare(image_bytes)
         body = _build_request_body(cfg, media, b64, prompt, max_tokens)
+        omitted = sorted(k for k in _learned_omit(cfg["model"]) if k in body)
+        for k in omitted:
+            body.pop(k, None)
+        if omitted:
+            info["omitted"] = omitted
         info["image_bytes"] = len(image_bytes)
         info["image_b64_len"] = len(b64)
         info["prompt_chars"] = len(prompt)
@@ -363,14 +398,19 @@ def _call(
                 timeout=timeout_s,
             )
             if r.status_code in (400, 429) and attempts < 4:
+                before = {k for k in _STYLE_KEYS if k in body}
                 stripped = _strip_offending_style(body, r.text)
                 if stripped is not None:
+                    removed = before - set(stripped.keys())
+                    if r.status_code == 400:
+                        _learn_omit(cfg["model"], removed)
                     info["degraded"] = sorted(
                         {"speed", "thinking", "output_config"} - set(stripped.keys())
                     )
+                    # Sin el cuerpo de la respuesta del proveedor en el log.
                     _log_verbose(
                         f"[claude] ↻ {purpose} reintento sin {info['degraded']} "
-                        f"(HTTP {r.status_code}: {r.text[:120]})"
+                        f"(HTTP {r.status_code}, body={len(r.text or '')}ch)"
                     )
                     body = stripped
                     continue
