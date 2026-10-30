@@ -2780,26 +2780,6 @@ def test_p1_verify_not_started_under_1_5s(rn, clk, monkeypatch):
     assert _is_manual(_post().json()) and seen["verify"] == []
 
 
-@pytest.mark.parametrize("read_s", [0.2, 3.0, 6.4, 6.5, 7.9, 8.0])
-def test_p1_worst_case_total_never_exceeds_13s(rn, clk, monkeypatch, read_s):
-    seen = _timed_ai(rn, clk, monkeypatch, read_s=read_s)  # verificación: todo su timeout
-    start = {}
-    real = idn._create_piece
-
-    async def timed_create(*a, **k):
-        start["t"] = clk["t"]
-        clk["t"] += 4.0  # el alta dura todo lo que se le garantiza
-        return await real(*a, **k)
-
-    monkeypatch.setattr(idn, "_create_piece", timed_create)
-    _receipt()
-    _post()
-    t0 = seen["read"][0][0]
-    if "t" in start:
-        assert start["t"] - t0 <= 13.0 - 4.0
-    assert clk["t"] - t0 <= 13.0
-
-
 def test_p1_no_time_to_create_is_manual_and_writes_nothing(rn, aienv, clk, monkeypatch):
     # La verificación se pasa de su timeout (la red no respeta el reloj): sin 4 s, no se crea.
     _timed_ai(rn, clk, monkeypatch, read_s=6.0, verify_over_s=3.0)
@@ -2979,3 +2959,141 @@ def test_q4_error_log_has_status_ms_and_length_only(cvenv, monkeypatch, capsys):
     log = capsys.readouterr().out
     line = [l for l in log.splitlines() if "HTTP 500" in l][0]
     assert secret not in log and "body_len=" in line and "ms" in line
+
+
+# Q1: puntos de control del reloj DENTRO del alta (t0 + 13 s, mismo reloj).
+
+
+def _slow(clk, monkeypatch, name, secs, log=None):
+    """Envuelve `aic.<name>` para que consuma `secs` del reloj falso."""
+    real = getattr(aic, name)
+
+    def run(*a, **k):
+        if log is not None:
+            log.append((name, clk["t"], k))
+        clk["t"] += secs
+        return real(*a, **k)
+
+    monkeypatch.setattr(aic, name, run)
+
+
+class _Slots:
+    """Cupo falso: las esperas listadas en `block` (1ª, 2ª…) no terminan nunca."""
+
+    def __init__(self, block=()):
+        self.block, self.n, self.released = set(block), 0, 0
+
+    async def acquire(self):
+        self.n += 1
+        if self.n in self.block:
+            await asyncio.sleep(3600)
+        return True
+
+    def release(self):
+        self.released += 1
+
+
+def _assert_nothing_written(aienv, before):
+    assert _snapshot(aienv) == before == (0, 0, 0, 0)  # variante, maestro, índice vivo, imagen
+    assert not (_db.ai_catalog_usage.find_one({"user_id": "u1"}) or {}).get("count")  # sin tope de altas
+    rec = _db.identify_receipts.find_one({})
+    assert rec is not None and not rec.get("ai_tried")  # recibo intacto y reintentable
+
+
+def _q1_post(caplog):
+    _receipt()
+    with caplog.at_level(_logging.INFO, logger=idn._log.name):
+        j = _post().json()
+    return j
+
+
+def test_q1_slow_prepare_skips_text_and_is_uncertain(rn, aienv, clk, monkeypatch, caplog):
+    log = []
+    _slow(clk, monkeypatch, "prepare_image", 11.6, log)  # quedan 1.4 s (< 1.5)
+    _slow(clk, monkeypatch, "create_new", 0.0, log)
+    before = _snapshot(aienv)
+    assert _is_manual(_q1_post(caplog))
+    assert aienv["text_calls"] == [] and [n for n, *_ in log] == ["prepare_image"]
+    assert "ai_catalog uncertain:timeout user=u1" in caplog.text
+    _assert_nothing_written(aienv, before)
+
+
+@pytest.mark.parametrize("prep_s,budget", [(8.0, 3.0), (9.0, 2.5), (11.0, 0.5)])
+def test_q1_dup_text_budget_trimmed_to_clock(rn, aienv, clk, monkeypatch, prep_s, budget):
+    _slow(clk, monkeypatch, "prepare_image", prep_s)
+    _receipt()
+    _post()
+    assert aienv["text_calls"][0][1] == pytest.approx(budget)
+
+
+def test_q1_slow_dup_stops_before_create(rn, aienv, clk, monkeypatch, caplog):
+    log = []
+    _slow(clk, monkeypatch, "check_duplicate", 11.6, log)
+    _slow(clk, monkeypatch, "create_new", 0.0, log)
+    before = _snapshot(aienv)
+    assert _is_manual(_q1_post(caplog))
+    assert [n for n, *_ in log] == ["check_duplicate"]  # create_new nunca arrancó
+    assert "ai_catalog uncertain:timeout user=u1" in caplog.text
+    _assert_nothing_written(aienv, before)
+
+
+def test_q1_first_slot_wait_times_out(rn, aienv, clk, monkeypatch, caplog):
+    slots = _Slots(block={1})
+    monkeypatch.setattr(idn, "_IDENTIFY_SLOTS", slots)
+    monkeypatch.setattr(idn, "_RESOLVE_CREATE_MIN_S", 1.6)
+    _timed_ai(rn, clk, monkeypatch, read_s=6.0, verify_over_s=3.4)  # quedan 1.6 s: espera de 0.1 s
+    log = []
+    _slow(clk, monkeypatch, "prepare_image", 0.0, log)
+    before = _snapshot(aienv)
+    assert _is_manual(_q1_post(caplog))
+    assert log == [] and slots.n == 1 and slots.released == 0
+    assert "ai_catalog uncertain:timeout user=u1" in caplog.text
+    _assert_nothing_written(aienv, before)
+
+
+def test_q1_second_slot_wait_times_out(rn, aienv, clk, monkeypatch, caplog):
+    slots = _Slots(block={2})
+    monkeypatch.setattr(idn, "_IDENTIFY_SLOTS", slots)
+    log = []
+    _slow(clk, monkeypatch, "check_duplicate", 11.4, log)  # quedan 1.6 s: espera de 0.1 s
+    _slow(clk, monkeypatch, "create_new", 0.0, log)
+    before = _snapshot(aienv)
+    assert _is_manual(_q1_post(caplog))
+    assert [n for n, *_ in log] == ["check_duplicate"]
+    assert slots.n == 2 and slots.released == 1  # solo se libera el cupo que se obtuvo
+    assert "ai_catalog uncertain:timeout user=u1" in caplog.text
+    _assert_nothing_written(aienv, before)
+
+
+@pytest.mark.parametrize("step", ["prepare_image", "check_duplicate"])
+@pytest.mark.parametrize("secs", [0.5, 6.0, 9.0, 10.0, 11.4, 11.6, 13.0])
+def test_q1_create_new_never_starts_with_less_than_1_5s(rn, aienv, clk, monkeypatch, step, secs):
+    log = []
+    _slow(clk, monkeypatch, step, secs)
+    _slow(clk, monkeypatch, "create_new", 0.0, log)
+    _receipt()
+    t0 = clk["t"]
+    j = _post().json()
+    if log:
+        assert 13.0 - (log[0][1] - t0) >= 1.5 and j["method"] == "o"
+    else:
+        assert _is_manual(j) and _rows() == 0
+        assert _db.identify_receipts.count_documents({}) == 1
+
+
+def test_q1_retry_after_clock_timeout_creates(rn, aienv, clk, monkeypatch):
+    real, n = aic.check_duplicate, []
+
+    def slow_once(*a, **k):
+        n.append(1)
+        if len(n) == 1:
+            clk["t"] += 11.6  # solo el primer intento se queda sin reloj
+        return real(*a, **k)
+
+    monkeypatch.setattr(aic, "check_duplicate", slow_once)
+    _receipt()
+    assert _is_manual(_post().json())
+    assert not _db.identify_receipts.find_one({}).get("ai_tried")
+    j = _post().json()
+    assert j["method"] == "o" and _rows() == 1
+    assert _db.identify_receipts.count_documents({}) == 0

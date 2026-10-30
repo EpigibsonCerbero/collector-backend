@@ -1311,17 +1311,59 @@ def _mark_ai_tried(db, receipt: dict) -> None:
         _log.warning("ai_catalog: no se pudo marcar el recibo", exc_info=True)
 
 
-async def _create_piece(db, uid: str, read: dict, data: bytes, receipt: dict) -> tuple[str, dict | None]:
+# Margen que debe quedar en el reloj total para cada paso del alta: por
+# debajo, la app (15 s) ya se habrá rendido antes de ver la pieza.
+_CREATE_STEP_MIN_S = 1.5
+# Rechazo por reloj DENTRO del alta: nada escrito, recibo intacto y sin marcar
+# `ai_tried` (la lectura ya pagada vale para un reintento).
+_CREATE_TIMEOUT = "uncertain:timeout"
+
+
+async def _take_slot(total_deadline: float) -> bool:
+    """Espera un cupo de `_IDENTIFY_SLOTS` sin pasar del reloj. False = venció."""
+    wait = total_deadline - _mono() - _CREATE_STEP_MIN_S
+    if wait <= 0:
+        return False
+    try:
+        await asyncio.wait_for(_IDENTIFY_SLOTS.acquire(), timeout=wait)
+    except asyncio.TimeoutError:
+        return False
+    return True
+
+
+async def _create_piece(
+    db, uid: str, read: dict, data: bytes, receipt: dict, total_deadline: float | None = None
+) -> tuple[str, dict | None]:
     """(decisión para el log, pieza o None). Solo el recorte + embedding (CPU)
     y el alta toman `_IDENTIFY_SLOTS`; la comprobación anti-duplicado (texto +
-    índice, hasta segundos) corre fuera para no frenar los identify."""
+    índice, hasta segundos) corre fuera para no frenar los identify.
+
+    `total_deadline` (instante de `_mono()`): reloj absoluto del endpoint. Cada
+    espera de cupo, el presupuesto de texto y el punto sin retorno (`create_new`)
+    lo comprueban; sin tiempo → `uncertain:timeout` sin escribir nada."""
+    if total_deadline is None:
+        total_deadline = _mono() + _RESOLVE_TOTAL_BUDGET_S
     try:
-        async with _IDENTIFY_SLOTS:
+        if not await _take_slot(total_deadline):
+            return _CREATE_TIMEOUT, None
+        try:
             prep = await asyncio.to_thread(ai_catalog.prepare_image, data)
-        chk = await asyncio.to_thread(ai_catalog.check_duplicate, db, read, prep.crop_vec)
+        finally:
+            _IDENTIFY_SLOTS.release()
+        text_budget = total_deadline - _mono() - _CREATE_STEP_MIN_S
+        chk = await asyncio.to_thread(
+            ai_catalog.check_duplicate, db, read, prep.crop_vec, text_budget_s=text_budget
+        )
         if chk.outcome == "new":
-            async with _IDENTIFY_SLOTS:
+            if not await _take_slot(total_deadline):
+                return _CREATE_TIMEOUT, None
+            try:
+                # Punto sin retorno: se vuelve a mirar el reloj justo antes.
+                if total_deadline - _mono() < _CREATE_STEP_MIN_S:
+                    return _CREATE_TIMEOUT, None
                 piece = await asyncio.to_thread(ai_catalog.create_new, db, uid, read, prep)
+            finally:
+                _IDENTIFY_SLOTS.release()
         else:
             piece = ai_catalog.check_result(chk)
     except Exception:  # noqa: BLE001
@@ -1405,8 +1447,8 @@ async def identify_resolve_new(
             print("[ai-catalog] rechazo timeout (sin presupuesto para el alta)", flush=True)
             decision = "rejected:timeout"
         else:
-            decision, piece = await _create_piece(db, uid, read, data, receipt)
-    if read is not None and piece is None and decision not in _RETRYABLE:
+            decision, piece = await _create_piece(db, uid, read, data, receipt, total_deadline)
+    if read is not None and piece is None and decision not in _RETRYABLE and decision != _CREATE_TIMEOUT:
         await asyncio.to_thread(_mark_ai_tried, db, receipt)
     _log.info("ai_catalog %s user=%s", decision, uid)
     if piece is None:

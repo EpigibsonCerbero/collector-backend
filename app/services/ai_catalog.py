@@ -422,8 +422,15 @@ def _same_casting_variants(db, read: dict) -> tuple[list[dict], bool]:
     return variants, capped or len(variants) >= limit
 
 
-def check_duplicate(db, read: dict, crop_vec: list[float] | None) -> DupCheck:
+def check_duplicate(
+    db, read: dict, crop_vec: list[float] | None, text_budget_s: float | None = None
+) -> DupCheck:
     """Tres salidas: duplicate / uncertain / new. Ante la duda, NO crear.
+
+    `text_budget_s`: presupuesto de la búsqueda textual (por defecto
+    `DUP_TEXT_BUDGET_S`). El llamador lo recorta a su reloj; sin tiempo (≤ 0)
+    la búsqueda no se hace y el resultado es incierto (`timeout`), nunca «nuevo».
+    Una búsqueda truncada con el presupuesto recortado también es `timeout`.
 
     Orden: id determinista → toy# Mini GT (con marca y casting de acuerdo) →
     variantes de la misma marca y casting (livery/dorsal/color) → texto →
@@ -469,11 +476,14 @@ def check_duplicate(db, read: dict, crop_vec: list[float] | None) -> DupCheck:
     if any(verdict == "ambiguous" for verdict, _ in verdicts):
         return DupCheck("uncertain", "same_casting_ambiguous")
 
-    doc, truncated = _dup_by_text(db, read, st.ai_catalog_dup_text_overlap)
+    budget = DUP_TEXT_BUDGET_S if text_budget_s is None else min(DUP_TEXT_BUDGET_S, text_budget_s)
+    if budget <= 0:
+        return DupCheck("uncertain", "timeout")
+    doc, truncated = _dup_by_text(db, read, st.ai_catalog_dup_text_overlap, budget)
     if doc is not None:
         return dup(doc, "text")
     if truncated:
-        return DupCheck("uncertain", "text_search_truncated")
+        return DupCheck("uncertain", "timeout" if budget < DUP_TEXT_BUDGET_S else "text_search_truncated")
 
     if crop_vec is not None:
         from app.services import vision
@@ -495,7 +505,9 @@ def find_duplicate(db, read: dict, crop_vec: list[float] | None) -> dict | None:
     return check_duplicate(db, read, crop_vec).piece
 
 
-def _dup_by_text(db, read: dict, threshold: float) -> tuple[dict | None, bool]:
+def _dup_by_text(
+    db, read: dict, threshold: float, budget_s: float = DUP_TEXT_BUDGET_S
+) -> tuple[dict | None, bool]:
     """(variante, truncada). Candidatos de `vision.search_catalog_by_text`,
     aceptados solo si casi todo su nombre está en la lectura (cobertura ≥
     umbral) y comparten un token del casting. Un livery gemelo («Midnight
@@ -510,8 +522,8 @@ def _dup_by_text(db, read: dict, threshold: float) -> tuple[dict | None, bool]:
     cast_toks = _casting_toks(read)
     stats: dict = {}
     t0 = _clock()
-    cands = vision.search_catalog_by_text(query, top_k=5, budget_s=DUP_TEXT_BUDGET_S, stats=stats)
-    truncated = bool(stats.get("truncated")) or (_clock() - t0) >= DUP_TEXT_BUDGET_S
+    cands = vision.search_catalog_by_text(query, top_k=5, budget_s=budget_s, stats=stats)
+    truncated = bool(stats.get("truncated")) or (_clock() - t0) >= budget_s
     for m in cands:
         name_toks = _toks(m.name)
         if len(name_toks) < 2 or not (name_toks & cast_toks):
