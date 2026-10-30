@@ -74,13 +74,16 @@ def get_status(db, user_id: str) -> dict[str, Any]:
     premium = is_premium(db, user_id)
     usage = db.scan_usage.find_one({"user_id": user_id, "day": today_key()}) or {}
     exp = doc.get("expires_at")
+    st = get_settings()
     return {
         "premium": premium,
         "plan": doc.get("period") if premium else None,
         "expires_at": _utc(exp) if exp else None,
         "will_renew": bool(doc.get("will_renew")) if premium else False,
         "scans_used": int(usage.get("count", 0)),
-        "scans_limit": None if premium else get_settings().free_daily_scans,
+        # Sin cuota activa no hay tope que mostrar ni que vender.
+        "scans_limit": None if (premium or not st.scan_limit_enabled) else st.free_daily_scans,
+        "limit_enabled": bool(st.scan_limit_enabled),
         "resets_at": next_reset(),
     }
 

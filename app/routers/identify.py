@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import logging
 import re
 import threading
 import time
@@ -818,6 +819,9 @@ _MAX_IMAGE_BYTES = 12 * 1024 * 1024
 # Reconciliación con RevenueCat bajo demanda: máximo una por usuario cada 60 s
 # (en memoria, un solo proceso).
 _RECONCILE_EVERY_S = 60
+# RevenueCat desde el identify: corto para no romper el presupuesto de 8 s.
+_RECONCILE_TIMEOUT_S = 2.0
+_log = logging.getLogger(__name__)
 _last_reconcile: dict[str, float] = {}
 _reconcile_lock = threading.Lock()
 
@@ -839,7 +843,9 @@ async def _reconcile(db, user_id: str) -> None:
     if not _reconcile_allowed(user_id):
         return
     try:
-        await asyncio.to_thread(revenuecat.sync_user, db, user_id)
+        await asyncio.to_thread(
+            revenuecat.sync_user, db, user_id, timeout=_RECONCILE_TIMEOUT_S
+        )
     except Exception as exc:  # noqa: BLE001
         _dbg("router", f"reconciliación RevenueCat falló: {exc}")
 
@@ -898,6 +904,9 @@ async def _identify_guarded(
                         return _quota_denied()
                 else:
                     used = 0
+        if held["reserved"]:
+            # Escaneos gratis por usuario y día: sirve para detectar abuso de cuentas.
+            _log.info("scan_free user=%s used=%d/%d", uid, used, st.free_daily_scans)
 
         async with _IDENTIFY_SLOTS:
             out = await asyncio.to_thread(_run_identify, data, brand)

@@ -45,16 +45,60 @@ def _ms_to_dt(ms) -> datetime | None:
     return datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
 
 
+def _real_id(value) -> str | None:
+    """Id de la app (no anónimo de RevenueCat) o None."""
+    if isinstance(value, str) and value and not value.startswith("$RCAnonymousID"):
+        return value
+    return None
+
+
+def _event_user(ev: dict) -> str | None:
+    """app_user_id; si es anónimo, original_app_user_id y luego el primer alias real."""
+    aliases = ev.get("aliases") if isinstance(ev.get("aliases"), list) else []
+    for cand in (ev.get("app_user_id"), ev.get("original_app_user_id"), *aliases):
+        uid = _real_id(cand)
+        if uid:
+            return uid
+    return None
+
+
+def _is_stale(doc: dict, ts: int | None) -> bool:
+    last = doc.get("last_event_ts_ms")
+    return ts is not None and last is not None and ts < last
+
+
+def _apply_transfer(db, ev: dict, ts: int | None) -> None:
+    """TRANSFER: la compra cambió de cuenta. Se resincronizan ambas partes con RevenueCat
+    (autoritativo): el origen pierde Premium si ya no tiene el entitlement."""
+    ids: list[str] = []
+    for key in ("transferred_from", "transferred_to"):
+        vals = ev.get(key) if isinstance(ev.get(key), list) else []
+        ids += [u for u in map(_real_id, vals) if u and u not in ids]
+    for uid in ids:
+        doc = db.subscriptions.find_one({"user_id": uid}) or {}
+        if _is_stale(doc, ts):
+            continue
+        if not revenuecat.sync_user(db, uid):
+            # RevenueCat no respondió: el 500 libera el id y RevenueCat reintenta.
+            raise RuntimeError("RevenueCat no respondió al procesar TRANSFER")
+        update = {"last_event_id": ev.get("id")}
+        if ts is not None:
+            update["last_event_ts_ms"] = ts
+        db.subscriptions.update_one({"user_id": uid}, {"$set": update})
+
+
 def _apply(db, ev: dict) -> None:
     etype = ev.get("type")
-    uid = ev.get("app_user_id")
-    if not uid or str(uid).startswith("$RCAnonymousID"):
-        return
     ts = ev.get("event_timestamp_ms")
     ts = int(ts) if isinstance(ts, (int, float)) and not isinstance(ts, bool) else None
+    if etype == "TRANSFER":
+        _apply_transfer(db, ev, ts)
+        return
+    uid = _event_user(ev)
+    if not uid:
+        return
     doc = db.subscriptions.find_one({"user_id": uid}) or {}
-    last = doc.get("last_event_ts_ms")
-    if ts is not None and last is not None and ts < last:
+    if _is_stale(doc, ts):
         return  # evento más viejo que el último aplicado
     # PRODUCT_CHANGE: el producto nuevo viene en new_product_id.
     product_id = (ev.get("new_product_id") if etype == "PRODUCT_CHANGE" else None) or ev.get("product_id")
@@ -92,7 +136,7 @@ def _apply(db, ev: dict) -> None:
         subscription.upsert_subscription(
             db, uid, premium=bool(doc.get("premium", False)), period=doc.get("period"),
             expires_at=exp or doc.get("expires_at") or datetime.now(timezone.utc),
-            will_renew=False, **common,
+            will_renew=False, revoked=bool(doc.get("revoked", False)), **common,
         )
     # BILLING_ISSUE y el resto: se mantiene el estado hasta expires_at
 

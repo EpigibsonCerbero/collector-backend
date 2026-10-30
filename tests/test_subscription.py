@@ -457,12 +457,13 @@ def test_two_parallel_requests_at_19_only_one_passes():
 
     def go():
         barrier.wait()
-        with _patch.object(identify_router.revenuecat, "sync_user", return_value=False):
-            codes.append(_ic.post(IDENT, json=_IMG, headers=hdr).status_code)
+        codes.append(_ic.post(IDENT, json=_IMG, headers=hdr).status_code)
 
-    ts = [threading.Thread(target=go) for _ in range(2)]
-    [t.start() for t in ts]
-    [t.join() for t in ts]
+    # Un solo patch fuera de los hilos: dos patch anidados en hilos dejan el mock puesto.
+    with _patch.object(identify_router.revenuecat, "sync_user", return_value=False):
+        ts = [threading.Thread(target=go) for _ in range(2)]
+        [t.start() for t in ts]
+        [t.join() for t in ts]
     assert sorted(codes) == [200, 402]
     assert _used(uid) == 20
 
@@ -492,7 +493,7 @@ def test_402_triggers_single_reconcile_and_grants_if_premium():
     _db.scan_usage.insert_one({"user_id": uid, "day": sub.today_key(), "count": 20})
     calls = []
 
-    def fake_sync(db, user_id):
+    def fake_sync(db, user_id, **kw):
         calls.append(user_id)
         _sub(user_id, expires_at=datetime.now(UTC) + timedelta(days=5))
         return True
@@ -561,3 +562,120 @@ def test_register_blocked_after_5_per_ip():
             "email": f"reg{i}@example.com", "username": f"reguser{i}", "password": "Passw0rd!x"})
         codes.append(r.status_code)
     assert codes[:5] == [201] * 5 and codes[5] == 429, codes
+
+
+# ── Ola final de correcciones ───────────────────────────────────────────────
+def test_status_flag_off_reports_no_limit(monkeypatch):
+    uid = _user("stoff")
+    monkeypatch.setattr(get_settings(), "scan_limit_enabled", False)
+    st = sub.get_status(_db, uid)
+    assert st["scans_limit"] is None and st["limit_enabled"] is False
+    monkeypatch.setattr(get_settings(), "scan_limit_enabled", True)
+    st = sub.get_status(_db, uid)
+    assert st["scans_limit"] == 20 and st["limit_enabled"] is True
+
+
+def test_webhook_anonymous_id_falls_back_to_original_then_aliases():
+    exp = _ms(datetime.now(UTC) + timedelta(days=30))
+    _post(_ev("INITIAL_PURCHASE", "an1", 1000, user="$RCAnonymousID:abc",
+              original_app_user_id="u-orig", expiration_at_ms=exp))
+    assert sub.is_premium(_db, "u-orig")
+    _post(_ev("INITIAL_PURCHASE", "an2", 1000, user="$RCAnonymousID:abc",
+              original_app_user_id="$RCAnonymousID:abc",
+              aliases=["$RCAnonymousID:abc", "u-alias"], expiration_at_ms=exp))
+    assert sub.is_premium(_db, "u-alias")
+    _post(_ev("INITIAL_PURCHASE", "an3", 1000, user="$RCAnonymousID:zz",
+              original_app_user_id="$RCAnonymousID:zz", aliases=["$RCAnonymousID:zz"],
+              expiration_at_ms=exp))
+    assert _db.subscriptions.count_documents({"user_id": {"$regex": "^\\$RC"}}) == 0
+
+
+def test_sync_entitlement_absent_downgrades_when_revenuecat_answers():
+    uid = "u-gone"
+    _sub(uid, expires_at=datetime.now(UTC) + timedelta(days=20))
+    assert sub.is_premium(_db, uid)
+    # RevenueCat caído: nada cambia.
+    with patch.object(revenuecat, "fetch_subscriber", return_value=None):
+        assert revenuecat.sync_user(_db, uid) is False
+    assert sub.is_premium(_db, uid)
+    # Payload malformado: nada cambia.
+    with patch.object(revenuecat, "fetch_subscriber", return_value={"subscriber": None}):
+        revenuecat.sync_user(_db, uid)
+    assert sub.is_premium(_db, uid)
+    # Respondió sin el entitlement: deja de ser Premium (conserva el resto).
+    with patch.object(revenuecat, "fetch_subscriber", return_value=_payload(_days(20), ent=False)):
+        assert revenuecat.sync_user(_db, uid) is True
+    doc = _db.subscriptions.find_one({"user_id": uid})
+    assert doc["premium"] is False and doc["will_renew"] is False
+    assert doc["product_id"] == "curio_pro_monthly" and doc["revoked"] is False
+    assert not sub.is_premium(_db, uid)
+
+
+def test_transfer_revokes_old_account_and_activates_new():
+    old, new = "u-old", "u-new"
+    _sub(old, expires_at=datetime.now(UTC) + timedelta(days=20))
+
+    def fake(user_id, timeout=5.0):
+        return _payload(_days(20), ent=(user_id == new))
+
+    with patch.object(revenuecat, "fetch_subscriber", side_effect=fake):
+        r = _post({"event": {"id": "t1", "type": "TRANSFER", "event_timestamp_ms": 5000,
+                             "transferred_from": [old, "$RCAnonymousID:q"], "transferred_to": [new]}})
+        assert r.status_code == 200
+        assert not sub.is_premium(_db, old) and sub.is_premium(_db, new)
+        # Idempotente por id de evento.
+        _sub(old, expires_at=datetime.now(UTC) + timedelta(days=20))
+        _post({"event": {"id": "t1", "type": "TRANSFER", "event_timestamp_ms": 5000,
+                         "transferred_from": [old], "transferred_to": [new]}})
+    assert sub.is_premium(_db, old)
+
+
+def test_transfer_respects_stale_guard():
+    old = "u-old2"
+    _sub(old, expires_at=datetime.now(UTC) + timedelta(days=20))
+    _db.subscriptions.update_one({"user_id": old}, {"$set": {"last_event_ts_ms": 9000}})
+    with patch.object(revenuecat, "fetch_subscriber", return_value=_payload(_days(20), ent=False)):
+        _post({"event": {"id": "t2", "type": "TRANSFER", "event_timestamp_ms": 1000,
+                         "transferred_from": [old], "transferred_to": []}})
+    assert sub.is_premium(_db, old)
+
+
+def test_expiration_after_refund_keeps_revoked_flag():
+    uid = "u-w"
+    end = datetime.now(UTC) + timedelta(days=30)
+    _post(_ev("INITIAL_PURCHASE", "x1", 1000, expiration_at_ms=_ms(end)))
+    _post(_ev("REFUND", "x2", 2000))
+    exp_at = datetime.now(UTC) - timedelta(days=1)
+    _post(_ev("EXPIRATION", "x3", 3000, expiration_at_ms=_ms(exp_at)))
+    assert _db.subscriptions.find_one({"user_id": uid})["revoked"] is True
+    # Un sync con el mismo vencimiento (viejo) no repone Premium ni da gracia.
+    with patch.object(revenuecat, "fetch_subscriber",
+                      return_value=_payload(exp_at.strftime("%Y-%m-%dT%H:%M:%SZ"))):
+        revenuecat.sync_user(_db, uid)
+    assert not sub.is_premium(_db, uid)
+
+
+def test_identify_reconcile_uses_short_timeout():
+    uid = _user("tmo")
+    _db.scan_usage.insert_one({"user_id": uid, "day": sub.today_key(), "count": 20})
+    with _patch.object(identify_router.revenuecat, "sync_user", return_value=False) as m:
+        assert _scan(uid).status_code == 402
+    assert m.call_args.kwargs.get("timeout") == identify_router._RECONCILE_TIMEOUT_S
+    assert identify_router._RECONCILE_TIMEOUT_S <= 2.0
+
+
+def test_fetch_subscriber_passes_timeout(monkeypatch):
+    monkeypatch.setattr(get_settings(), "revenuecat_secret_key", "sk_x")
+    with patch("app.services.revenuecat.httpx.get", side_effect=RuntimeError("x")) as g:
+        revenuecat.fetch_subscriber("u-x", timeout=2.0)
+        assert g.call_args.kwargs["timeout"] == 2.0
+        revenuecat.fetch_subscriber("u-x")
+        assert g.call_args.kwargs["timeout"] == 5.0
+
+
+def test_free_scan_is_logged(caplog):
+    import logging
+    uid = _user("logme")
+    with caplog.at_level(logging.INFO, logger="app.routers.identify"):
+        assert _scan(uid).status_code == 200
+    assert f"scan_free user={uid} used=1/20" in caplog.text

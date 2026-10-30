@@ -18,8 +18,14 @@ API_URL = "https://api.revenuecat.com/v1/subscribers/"
 ENTITLEMENT = "premium"
 
 
-def fetch_subscriber(app_user_id: str) -> dict | None:
-    """GET del suscriptor. None si no hay clave, hay error de red o la respuesta no es JSON."""
+DEFAULT_TIMEOUT_S = 5.0
+
+
+def fetch_subscriber(app_user_id: str, timeout: float = DEFAULT_TIMEOUT_S) -> dict | None:
+    """GET del suscriptor. None si no hay clave, hay error de red o la respuesta no es JSON.
+
+    `timeout` corto desde el identify (presupuesto de 8 s); 5 s en /sync y webhooks.
+    """
     key = get_settings().revenuecat_secret_key
     if not key:
         return None
@@ -27,7 +33,7 @@ def fetch_subscriber(app_user_id: str) -> dict | None:
         r = httpx.get(
             API_URL + quote(app_user_id, safe=""),
             headers={"Authorization": f"Bearer {key}", "Accept": "application/json"},
-            timeout=5.0,
+            timeout=timeout,
         )
         if r.status_code != 200:
             return None
@@ -95,14 +101,35 @@ def entitlement_from_subscriber(payload: dict) -> dict | None:
         return None
 
 
-def sync_user(db, user_id: str) -> bool:
-    """Consulta RevenueCat y aplica el estado. False si no respondió (estado previo intacto)."""
-    payload = fetch_subscriber(user_id)
+def entitlement_absent(payload: dict) -> bool:
+    """True si RevenueCat respondió bien formado y el entitlement `premium` no está."""
+    try:
+        ents = payload["subscriber"]["entitlements"]
+    except (KeyError, TypeError):
+        return False
+    return isinstance(ents, dict) and ENTITLEMENT not in ents
+
+
+def sync_user(db, user_id: str, timeout: float = DEFAULT_TIMEOUT_S) -> bool:
+    """Consulta RevenueCat y aplica el estado. False si no respondió (estado previo intacto).
+
+    RevenueCat es la fuente de verdad: si responde sin el entitlement `premium`
+    (p. ej. tras un TRANSFER a otra cuenta) el usuario deja de ser Premium.
+    Un error de red o un payload malformado nunca degrada.
+    """
+    payload = fetch_subscriber(user_id, timeout=timeout)
     if payload is None:
         return False
     ent = entitlement_from_subscriber(payload)
     if ent is None:
-        return True  # respondió, pero no hay entitlement utilizable: no se toca nada
+        if entitlement_absent(payload):
+            # Se conservan producto, vencimiento y `revoked`; solo se apaga el acceso.
+            db.subscriptions.update_one(
+                {"user_id": user_id},
+                {"$set": {"premium": False, "will_renew": False,
+                          "updated_at": datetime.now(timezone.utc)}},
+            )
+        return True  # malformado: no se toca nada
     doc = db.subscriptions.find_one({"user_id": user_id}) or {}
     if doc.get("revoked"):
         # Tras un reembolso/revocación solo una compra posterior (vencimiento más nuevo) lo repone.
