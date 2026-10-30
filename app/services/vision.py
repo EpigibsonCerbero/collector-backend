@@ -1813,6 +1813,19 @@ def _txt_compact_keep_spaces(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", t)
 
 
+def _fallback_widened() -> bool:
+    """VISION_FALLBACK_ON_MANUAL (por defecto apagado): amplía el disparador del respaldo."""
+    return os.environ.get("VISION_FALLBACK_ON_MANUAL", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _fallback_should_run(fb_on: bool, has_identity: bool, toy, useful_text: bool, visual_ok: bool, *, widen: bool = False) -> bool:
+    """Decide si corre el respaldo de visión en la nube. Apagado: condición histórica.
+    Con `widen`, ya no exige que el OCR esté vacío de texto útil."""
+    if not fb_on or has_identity or toy is not None or visual_ok:
+        return False
+    return True if widen else not useful_text
+
+
 def identify_image(image_bytes: bytes, brand_hint: str | None = None) -> VisionResult:
     """Corre la cascada completa sobre los bytes de la foto.
 
@@ -1990,7 +2003,7 @@ def identify_image(image_bytes: bytes, brand_hint: str | None = None) -> VisionR
     _fb = os.environ.get("VISION_FALLBACK") or ("gemini" if os.environ.get("GEMINI_FALLBACK") == "1" else "off")
     _gemini_on = _fb in ("claude", "gemini")
     _mc_future = None
-    if _gemini_on and not has_identity and toy is None and not useful_text and not visual_ok:
+    if _fallback_should_run(_gemini_on, has_identity, toy, useful_text, visual_ok, widen=_fallback_widened()):
         # El multicrop (CPU, ~2 s) y Gemini (red, ~2-3 s) son independientes:
         # se solapan. Solo si el multicrop va a hacer falta (visual flojo).
         if emb is not None and not visual_ok and (not dnn_matches or dnn_matches[0].score < 0.78):

@@ -129,8 +129,8 @@ def _ok(payload):
 def cvenv(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key-for-tests")
     monkeypatch.setattr(cv, "_prepare", lambda b: ("b64", "image/jpeg"))
-    cv._cache.clear()
     cv._cat_cache.clear()
+    getattr(cv, "_logged", set()).clear()
     cv._breaker_reset()
     calls = []
     state = {"resp": _ok({})}
@@ -1551,3 +1551,128 @@ def test_sync_hidden_failure_keeps_set_and_does_not_retry(hid, monkeypatch):
     finally:
         _vis.set_hidden_ids(set())
         idn._HIDDEN_SYNC["at"] = 0.0
+
+
+# ── Task 9: respaldo del identify sobre la misma lectura ───────────────────
+from app.services.gemini_vision import gemini_to_ocr_text as _g2t
+
+_FULL = {"es_diecast": True, "brand": "Mini GT", "casting": "Nissan Skyline", "modelo": "GT-R R34",
+         "livery": "azul con franja", "dorsal": "80", "color": "azul", "texto": "MINI GT 14+",
+         "serie": "Japan", "toy_number": "872", "confidence": "alto"}
+
+
+def test_one_paid_call_per_photo_fallback_then_creation(cvenv):
+    calls, st = cvenv
+    st["resp"] = _ok(_FULL)
+    assert cv.read_packaging_with_claude(b"same") is not None
+    assert cv.read_for_catalog(b"same")["es_diecast"] is True
+    assert len(calls) == 1
+
+
+def test_one_paid_call_per_photo_creation_then_fallback(cvenv):
+    calls, st = cvenv
+    st["resp"] = _ok(_FULL)
+    assert cv.read_for_catalog(b"same2") is not None
+    assert cv.read_packaging_with_claude(b"same2") is not None
+    assert len(calls) == 1
+
+
+def test_adapter_keys_and_mapping_feed_gemini_to_ocr_text(cvenv):
+    _, st = cvenv
+    st["resp"] = _ok(_FULL)
+    r = cv.read_packaging_with_claude(b"m1")
+    assert set(r) == {"brand", "model", "variant", "toy_number", "series", "color", "year",
+                      "driver", "full_text", "confidence"}
+    assert r["model"] == "GT-R R34" and r["variant"] == "azul con franja 80"
+    assert r["series"] == "Japan" and r["full_text"] == "MINI GT 14+" and r["driver"] is None
+    assert r["confidence"] == "alto" and r["toy_number"] == "872"
+    t = _g2t(r)
+    assert "Mini GT" in t and "GT-R R34" in t and "MGT00872" in t
+
+
+def test_adapter_fallbacks_casting_and_color(cvenv):
+    _, st = cvenv
+    st["resp"] = _ok({"es_diecast": True, "brand": "Hot Wheels", "casting": "Civic", "color": "rojo"})
+    r = cv.read_packaging_with_claude(b"m2")
+    assert r["model"] == "Civic" and r["variant"] == "rojo"
+
+
+def test_adapter_none_when_not_diecast(cvenv):
+    _, st = cvenv
+    st["resp"] = _ok({"es_diecast": False, "texto": "documento"})
+    assert cv.read_packaging_with_claude(b"m3") is None
+
+
+def test_timeout_not_cached_and_does_not_trip_breaker(cvenv, monkeypatch):
+    calls, st = cvenv
+
+    def boom(*a, **k):
+        calls.append(k)
+        raise cv.requests.Timeout("t")
+
+    monkeypatch.setattr(cv.requests, "post", boom)
+    assert cv.read_packaging_with_claude(b"to") is None
+    assert cv.breaker_open() is False
+    st["resp"] = _ok(_FULL)
+    monkeypatch.setattr(cv.requests, "post", lambda *a, **k: (calls.append(k), st["resp"])[1])
+    assert cv.read_for_catalog(b"to") is not None
+    assert len(calls) == 2
+
+
+def test_timeouts_adapter_short_catalog_long(cvenv, monkeypatch):
+    calls, st = cvenv
+    st["resp"] = _ok(_FULL)
+    cv.read_packaging_with_claude(b"t1")
+    cv.read_for_catalog(b"t2")
+    assert calls[0]["timeout"] == cv._TIMEOUT_S
+    assert calls[1]["timeout"] == cv._CATALOG_TIMEOUT_S == 12.0
+    cv.read_for_catalog(b"t3", timeout_s=2.0)
+    assert calls[2]["timeout"] == 2.0
+
+
+def test_int_dorsal_and_toy_coerced_bool_not(cvenv):
+    _, st = cvenv
+    st["resp"] = _ok({"es_diecast": True, "dorsal": 80, "toy_number": 872})
+    r = cv.read_for_catalog(b"c1")
+    assert r["dorsal"] == "80" and r["toy_number"] == "872"
+    st["resp"] = _ok({"es_diecast": True, "dorsal": True, "toy_number": False})
+    r = cv.read_for_catalog(b"c2")
+    assert r["dorsal"] is None and r["toy_number"] is None
+
+
+def test_no_key_logged_once(cvenv, monkeypatch, capsys):
+    monkeypatch.delenv("ANTHROPIC_API_KEY")
+    cv.read_for_catalog(b"k1")
+    cv.read_for_catalog(b"k2")
+    assert capsys.readouterr().out.count("sin ANTHROPIC_API_KEY") == 1
+
+
+def test_unparseable_logged_once_without_body(cvenv, capsys):
+    _, st = cvenv
+    st["resp"] = _Resp(200, {"content": [{"type": "text", "text": "SECRETBODY sin json"}]})
+    cv.read_for_catalog(b"u1")
+    cv.read_for_catalog(b"u2")
+    out = capsys.readouterr().out
+    assert out.count("respuesta sin JSON") == 1 and "SECRETBODY" not in out
+
+
+@pytest.mark.parametrize("on", [True, False])
+@pytest.mark.parametrize("ident", [True, False])
+@pytest.mark.parametrize("toy", [None, "MGT00001"])
+@pytest.mark.parametrize("useful", [True, False])
+@pytest.mark.parametrize("vok", [True, False])
+@pytest.mark.parametrize("fb", [True, False])
+def test_fallback_should_run_all_combinations(on, ident, toy, useful, vok, fb):
+    old = fb and not ident and toy is None and not useful and not vok
+    wide = fb and not ident and toy is None and not vok
+    got = _vis._fallback_should_run(fb, ident, toy, useful, vok, widen=on)
+    assert got == (wide if on else old)
+
+
+def test_fallback_flag_default_off(monkeypatch):
+    monkeypatch.delenv("VISION_FALLBACK_ON_MANUAL", raising=False)
+    assert _vis._fallback_widened() is False
+    monkeypatch.setenv("VISION_FALLBACK_ON_MANUAL", "1")
+    assert _vis._fallback_widened() is True
+    monkeypatch.setenv("VISION_FALLBACK_ON_MANUAL", "0")
+    assert _vis._fallback_widened() is False
