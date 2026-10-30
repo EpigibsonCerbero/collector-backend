@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 import numpy as np
+from pymongo import ReturnDocument
 
 from app.config import get_settings
 from app.db import as_id
@@ -557,22 +558,34 @@ def confirm(db, variant_id: str, user_id: str) -> bool:
 
     El creador cuenta como primer confirmador: la pieza pasa a `verified` con
     >= 2 usuarios DISTINTOS en {created_by} ∪ confirmed_by. Idempotente, nunca
-    desverifica. Solo `origin == "ai"`; el resto no se toca (sin escritura).
-    True solo si ESTA llamada puso `verified=True`."""
+    desverifica y se AUTOCURA: la cuenta se evalúa siempre sobre el documento
+    fresco devuelto por el `$addToSet`, así que una llamada posterior corrige
+    una escritura previa a medias o una lectura vieja. Solo `origin == "ai"`;
+    el resto no se toca (sin escritura). True solo si ESTA llamada puso
+    `verified=True`."""
     try:
         doc = _resolve_variant(db, variant_id)
         if not doc or doc.get("origin") != "ai" or not user_id:
             return False
         if doc.get("verified") is True:
             return False
-        creator = doc.get("created_by")
-        users = {str(u) for u in (doc.get("confirmed_by") or [])}
+        uid = str(user_id)
+        creator = str(doc["created_by"]) if doc.get("created_by") else None
+        if uid != creator and uid not in {str(u) for u in (doc.get("confirmed_by") or [])}:
+            fresh = db.variants.find_one_and_update(
+                {"_id": doc["_id"], "origin": "ai"},
+                {"$addToSet": {"confirmed_by": uid}},
+                return_document=ReturnDocument.AFTER,
+            )
+            if not fresh:
+                return False
+        else:
+            fresh = doc
+        if fresh.get("verified") is True:
+            return False
+        users = {str(u) for u in (fresh.get("confirmed_by") or [])}
         if creator:
-            users.add(str(creator))
-        if str(user_id) in users:
-            return False  # el creador o quien ya confirmó: nada cambia
-        users.add(str(user_id))
-        db.variants.update_one({"_id": doc["_id"]}, {"$addToSet": {"confirmed_by": str(user_id)}})
+            users.add(creator)
         if len(users) < 2:
             return False
         res = db.variants.update_one(

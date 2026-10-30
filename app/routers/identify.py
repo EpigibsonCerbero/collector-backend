@@ -8,8 +8,8 @@ del cliente para que el cambio sea transparente.
 from __future__ import annotations
 
 import asyncio
-import contextvars
 import base64
+import contextvars
 import hashlib
 import io
 import logging
@@ -198,8 +198,14 @@ class PeritajeOut(BaseModel):
 # ── Resolución contra Mongo ─────────────────────────────────────────────────
 
 
+# Campos de moderación de piezas de IA: nunca salen hacia la app.
+_MODERATION_FIELDS = ("origin", "verified", "source_confidence", "confirmed_by", "created_by", "hidden")
+
+
 def _variant_out(doc: dict, master: dict | None = None) -> dict[str, Any]:
     data = serialize(doc) or {}
+    for k in _MODERATION_FIELDS:
+        data.pop(k, None)
     if master is not None:
         data["item_master"] = serialize(master)
     return data

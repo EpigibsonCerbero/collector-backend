@@ -15,6 +15,7 @@ dbmod.get_db = lambda: _db
 
 from app import ratelimit
 from app.config import get_settings
+from app.routers import garage as _garage
 from app.routers import identify as idn
 from app.security import CurrentUser
 
@@ -1119,10 +1120,6 @@ def test_bookkeeping_failure_after_create_is_not_500(rn, monkeypatch):
 
 # ── Task 6: verificación comunitaria ───────────────────────────────────────
 
-from bson import ObjectId as _OID
-
-from app.routers import garage as _garage
-
 
 def _ai_piece(_id="ai1", created_by="u1", **kw):
     _db.variants.delete_many({})
@@ -1165,15 +1162,69 @@ def test_two_non_creators_verify_without_creator():
     assert aic.confirm(_db, "ai1", "b") is True
 
 
+def _count_writes(monkeypatch):
+    n = []
+    for name in ("update_one", "find_one_and_update", "update_many"):
+        real = getattr(_db.variants, name)
+        monkeypatch.setattr(type(_db.variants), name,
+                            lambda self, *a, _r=real, _n=name, **k: (n.append(_n), _r(*a, **k))[1],
+                            raising=False)
+    return n
+
+
 def test_confirm_ignores_non_ai_pieces(monkeypatch):
     _db.variants.delete_many({})
     _db.variants.insert_one({"_id": "s1", "variant_name": "x"})
     _db.variants.insert_one({"_id": "s2", "origin": "scrape", "verified": True})
-    calls = []
-    real = _db.variants.update_one
+    writes = _count_writes(monkeypatch)
     assert aic.confirm(_db, "s1", "u2") is False and aic.confirm(_db, "s2", "u2") is False
     assert aic.confirm(_db, "missing", "u2") is False
+    assert writes == []
     assert "confirmed_by" not in _v("s1") and "confirmed_by" not in _v("s2")
+
+
+def test_creator_alone_writes_nothing(monkeypatch):
+    _ai_piece()
+    writes = _count_writes(monkeypatch)
+    assert aic.confirm(_db, "ai1", "u1") is False
+    assert writes == []
+
+
+def test_stale_read_does_not_lose_verification(monkeypatch):
+    """A y B leen confirmed_by=[] a la vez (sin creador): la 2ª decide con el
+    documento fresco del $addToSet y verifica."""
+    _ai_piece(created_by=None)
+    stale = _v()
+    monkeypatch.setattr(aic, "_resolve_variant", lambda db, vid: dict(stale))
+    assert aic.confirm(_db, "ai1", "A") is False
+    assert aic.confirm(_db, "ai1", "B") is True  # lectura vieja: confirmed_by=[]
+    assert _v()["verified"] is True and sorted(_v()["confirmed_by"]) == ["A", "B"]
+
+
+def test_failed_second_update_self_heals(monkeypatch):
+    _ai_piece()
+    cls = type(_db.variants)
+    real = cls.update_one
+    state = {"boom": True}
+
+    def flaky(self, *a, **k):
+        if state["boom"]:
+            state["boom"] = False
+            raise RuntimeError("db blip")
+        return real(self, *a, **k)
+
+    monkeypatch.setattr(cls, "update_one", flaky)
+    assert aic.confirm(_db, "ai1", "u2") is False  # $addToSet ok, verified falló
+    assert _v()["confirmed_by"] == ["u2"] and _v()["verified"] is False
+    assert aic.confirm(_db, "ai1", "u2") is True  # misma usuaria reintenta y verifica
+    assert _v()["verified"] is True
+    assert aic.confirm(_db, "ai1", "u1") is False  # creador sobre pieza ya verificada
+
+
+def test_creator_call_heals_when_others_confirmed():
+    _ai_piece(confirmed_by=["u2"])  # quedó sin verificar por un fallo previo
+    assert aic.confirm(_db, "ai1", "u1") is True
+    assert _v()["verified"] is True
 
 
 def test_confirm_never_raises():
@@ -1224,6 +1275,26 @@ def test_identify_confirm_failure_does_not_break(monkeypatch):
     monkeypatch.setattr(idn, "_run_identify", run)
     out = asyncio.run(idn._identify_guarded(None, IMG, None, CurrentUser({"id": "u2"})))
     assert out.needs_manual is False
+
+
+def test_real_run_identify_toy_hit_confirms_once(monkeypatch):
+    """Ruta real de _run_identify (solo `identify_image`, el pipeline pesado, se
+    simula) con ganador IA sin verificar por toy number."""
+    _db.items.delete_many({})
+    _db.items.insert_one({"_id": "m1", "name": "GT-R", "manufacturer": "Mini GT", "release_year": 2023})
+    _ai_piece(toy_number="MGT00555", item_master_id="m1", confirmed_by=[])
+    res = _vis.VisionResult(toy_number="MGT00555", needs_manual=False, confidence=0.9)
+    monkeypatch.setattr(idn, "identify_image", lambda img, brand_hint=None: res)
+    seen = []
+    real = aic.confirm
+    monkeypatch.setattr(aic, "confirm", lambda *a: (seen.append(a), real(*a))[1])
+    out = asyncio.run(idn._identify_guarded(None, PHOTO, None, CurrentUser({"id": "u2"})))
+    assert out.method == "o" and out.item is not None
+    assert seen == [(_db, "ai1", "u2")]
+    assert _v()["verified"] is True
+    blob = out.model_dump_json()
+    for k in ("origin", "verified", "confirmed_by", "created_by"):
+        assert k not in blob
 
 
 @pytest.fixture
