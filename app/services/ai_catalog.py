@@ -152,7 +152,8 @@ def sanitize_read(read: dict | None) -> dict | None:
     Rechazo (= barrera, no se crea nada): algún campo guardable trae algo con
     forma de URL (`http`, `www.`, `://`) o de marcado HTML. Si no: sin
     caracteres de control ni `<>`, espacios colapsados y longitudes tope.
-    Un número Mini GT fuera de 1..`ai_catalog_mgt_max` se ignora (None)."""
+    Un número Mini GT fuera de 1..`ai_catalog_mgt_max` se ignora (None).
+    El año solo sobrevive si aparece en el texto leído (el modelo lo inventa)."""
     if not read:
         return read
     out = dict(read)
@@ -165,6 +166,14 @@ def sanitize_read(read: dict | None) -> dict | None:
         out[k] = _clean_text(v, cap)
     if out.get("toy_number") and _brand_slug(out.get("brand")) in _TOY_ID_BRANDS and _norm_toy(out) is None:
         out["toy_number"] = None
+    year = out.get("year")
+    if isinstance(year, int) and not isinstance(year, bool):
+        texto = str(out.get("texto") or "")
+        alnum = sum(ch.isalnum() for ch in texto)
+        has_anchor = bool(out.get("toy_number")) or bool(out.get("serie")) or alnum >= 4
+        if not has_anchor:
+            # Sin evidencia física del objeto, el año lo suele inventar el modelo.
+            out["year"] = None
     return out
 
 
@@ -202,13 +211,47 @@ def gate_receipt(receipt: dict | None) -> str | None:
 
 
 def gate_read(read: dict | None) -> str | None:
-    """Parte de la barrera que necesita la lectura: diecast, confianza, identidad."""
+    """Parte de la barrera que necesita la lectura: diecast, confianza, identidad.
+
+    El orden importa: identidad ANTES que confianza. Un `missing_identity` no
+    se rescata con el verificador; un `low_confidence` sí (si las lecturas
+    coinciden). Al revés, una lectura «medio» sin marca ni modelo se colaba.
+    """
     if not read or read.get("es_diecast") is not True:
         return "no_diecast"
-    if read.get("confidence") != "alto":
-        return "low_confidence"
     if not str(read.get("brand") or "").strip() or not str(read.get("casting") or "").strip():
         return "missing_identity"
+    if read.get("confidence") != "alto":
+        return "low_confidence"
+    return None
+
+
+# Ancla mínima de identidad para CREAR: sin evidencia física del objeto, no se
+# da de alta. Un render o una foto IA puede parecer un coche y mentir sobre la
+# marca; el texto impreso o el número de empaque no se inventan tan fácil.
+_MIN_ANCHOR_CHARS = 4
+
+
+def gate_create(read: dict | None) -> str | None:
+    """Barrera de ALTA (más estricta que `gate_read`). Motivo o None.
+
+    Rechaza además:
+      - `not_foto_real`: render, ilustración, foto generada por IA o coche real
+        a escala 1:1 (no un juguete físico).
+      - `no_anchor`: sin toy_number, serie ni texto legible (≥ `_MIN_ANCHOR_CHARS`
+        alfanuméricos). Es la barrera que frena un render sin empaque.
+    """
+    reason = gate_read(read)
+    if reason:
+        return reason
+    if read.get("es_foto_real") is not True:
+        return "not_foto_real"
+    toy = str(read.get("toy_number") or "").strip()
+    serie = str(read.get("serie") or "").strip()
+    texto = str(read.get("texto") or "").strip()
+    alnum = sum(ch.isalnum() for ch in texto)
+    if not toy and not serie and alnum < _MIN_ANCHOR_CHARS:
+        return "no_anchor"
     return None
 
 
@@ -228,10 +271,24 @@ def _load_master(db, doc: dict) -> dict | None:
 
 def _piece_out(doc: dict, master: dict | None, created: bool) -> dict:
     """Variante con el contrato de la app (`ItemVariantOut` + `item_master`)
-    más los campos internos del doc y `created`. Pasar por `strip_internal`."""
+    más los campos internos del doc y `created`. Pasar por `strip_internal`.
+
+    No deja que un master a medias (datos previos rotos) tumbe la respuesta
+    cuando la pieza YA está insertada: degrada a un dict mínimo.
+    """
     from app.routers.catalog import _variant_out
 
-    out = _variant_out(doc, master).model_dump()
+    try:
+        out = _variant_out(doc, master).model_dump()
+    except Exception:  # noqa: BLE001
+        out = {
+            "id": doc.get("id") or str(doc.get("_id")),
+            "variant_name": doc.get("variant_name"),
+            "toy_number": doc.get("toy_number"),
+            "main_image_url": doc.get("main_image_url"),
+            "images": doc.get("images") or [],
+            "body_color": doc.get("body_color"),
+        }
     for k in _INTERNAL:
         if k in doc:
             out[k] = doc[k]
@@ -686,6 +743,11 @@ def create_new(db, user_id: str, read: dict, prep: Prepared) -> dict:
     }
     # `items.release_year` es obligatorio en el esquema: 0 = año desconocido
     # (la app lo trata como falso y las facetas/orden por año lo ignoran).
+    # Sin marca ni modelo reconocibles NO se rellena con «Desconocido»: la
+    # pieza no entra al catálogo compartido (el llamador ya pasó `gate_create`,
+    # esto es la red de seguridad).
+    if not brand or not casting:
+        return {"outcome": "uncertain", "reason": "missing_identity", "created": False}
     master = {
         "name": casting,
         "manufacturer": brand,

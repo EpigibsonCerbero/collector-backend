@@ -152,7 +152,10 @@ def test_read_for_catalog_parses_json(cvenv):
     assert r["es_diecast"] is True and r["brand"] == "Mini GT" and r["year"] == 1999
     assert r["confidence"] == "alto" and r["modelo"] is None and r["toy_number"] is None
     body = calls[0]["json"]
-    assert body["temperature"] == 0 and body["max_tokens"] >= 600
+    # Sin parámetros de muestreo: la API 2026-10-21 los rechaza con pensamiento
+    # y no hacen falta para extraer JSON.
+    assert "temperature" not in body and body["max_tokens"] >= 600
+    assert body["model"] and body["thinking"] == {"type": "disabled"}
     txt = body["messages"][0]["content"][1]["text"]
     assert "nunca inventes" in txt
     cv.read_for_catalog(b"img1")
@@ -416,9 +419,10 @@ PHOTO = _jpeg()
 
 
 def _read(**kw):
-    r = {"es_diecast": True, "brand": "Mini GT", "casting": "Nissan Skyline GT-R R34",
+    r = {"es_diecast": True, "es_foto_real": True, "brand": "Mini GT", "casting": "Nissan Skyline GT-R R34",
          "modelo": None, "color": "azul", "dorsal": None, "livery": "Bayside Blue",
-         "texto": "", "toy_number": None, "serie": None, "year": None, "confidence": "alto"}
+         "texto": "Nissan Skyline GT-R R34 empaque", "toy_number": None, "serie": None, "year": None,
+         "confidence": "alto"}
     r.update(kw)
     return r
 
@@ -879,7 +883,7 @@ def rn(aienv, monkeypatch):
     calls = []
     state = {"read": _read(), "who": who, "calls": calls}
 
-    def fake_read(data):
+    def fake_read(data, *a, **k):
         calls.append(data)
         r = state["read"]
         if isinstance(r, Exception):
@@ -2101,3 +2105,408 @@ def test_live_corrupt_file_not_overwritten_when_it_cannot_be_moved(vidx, monkeyp
     with pytest.raises(OSError):
         _vis.live_index_append(_entry(10), _unit(1010).tolist())
     assert (vidx / "live.json").read_text() == "{not json"
+
+
+# ── Visión general: selección de modelo/velocidad/pensamiento + usage ────────
+
+
+def test_call_opts_resolve_defaults_and_clamp():
+    o = cv.CallOpts().resolved()
+    assert o["model"] and o["speed"] == "standard" and o["thinking"] in ("off", "auto", "extended")
+    o2 = cv.CallOpts(model="claude-opus-5-5", speed="fast", thinking="auto", effort="high").resolved()
+    assert o2 == {"model": "claude-opus-5-5", "speed": "fast", "thinking": "auto", "effort": "high"}
+    o3 = cv.CallOpts(speed="ludicrous", thinking="mega", effort="ultra").resolved()
+    assert o3["speed"] == "standard" and o3["thinking"] == "off" and o3["effort"] == ""
+
+
+def test_build_request_body_carries_style(cvenv):
+    _, st = cvenv
+    st["resp"] = _ok({"tipo": "objeto", "titulo": "taza", "confidence": "alto"})
+    r = cv.analyze(b"img-style", mode="general",
+                   opts=cv.CallOpts(model="claude-sonnet-5-5", speed="fast", thinking="auto", effort="low"))
+    assert r["titulo"] == "taza"
+    body = cvenv[0][0]["json"]
+    assert body["model"] == "claude-sonnet-5-5"
+    assert body["speed"] == "fast"
+    assert body["thinking"] == {"type": "adaptive"}
+    assert body["output_config"] == {"effort": "low"}
+    # usage de la última llamada
+    info = cv.last_call_info()
+    assert info["model"] == "claude-sonnet-5-5" and info["ms"] >= 0
+    assert info["usage"] is not None or info.get("http_status") == 200
+
+
+def test_analyze_general_mode_parses_any_json(cvenv):
+    _, st = cvenv
+    st["resp"] = _ok({"tipo": "documento", "titulo": "FODA", "descripcion": "x", "colores": ["blanco"]})
+    r = cv.analyze(b"doc1", mode="general")
+    assert r["tipo"] == "documento"
+    st["resp"] = _ok({"texto": "hola", "lineas": ["hola"], "confidence": "alto"})
+    r2 = cv.analyze(b"doc2", mode="texto")
+    assert r2["texto"] == "hola"
+
+
+def test_ai_vision_endpoint_admin_only_and_no_provider_leak(aienv, monkeypatch):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from app.routers import ai as air
+    from app.security import CurrentUser, require_admin
+
+    api = FastAPI()
+    api.include_router(air.router, prefix="/api/v1")
+    client = TestClient(api)
+    import base64 as _b64
+
+    from app.security import create_access_token
+
+    body = {"image_base64": _b64.b64encode(b"xx").decode()}
+    assert client.post("/api/v1/ai/vision", json=body).status_code == 401
+    # usuario normal (no admin): 403 — require_admin real, sin overrides
+    monkeypatch.setattr(get_settings(), "admin_user_ids", "adm")
+    tok_u = create_access_token("u1", "u1")
+    h_u = {"Authorization": f"Bearer {tok_u}"}
+    assert client.post("/api/v1/ai/vision", json=body, headers=h_u).status_code == 403
+    assert client.get("/api/v1/ai/vision/config", headers=h_u).status_code == 403
+    assert client.get("/api/v1/ai/vision/last", headers=h_u).status_code == 403
+    # admin: 200 y sin texto del proveedor
+    tok_a = create_access_token("adm", "adm")
+    h_a = {"Authorization": f"Bearer {tok_a}"}
+    monkeypatch.setattr(cv, "analyze", lambda *a, **k: {"titulo": "ok"})
+    monkeypatch.setattr(cv, "last_call_info", lambda: {
+        "usage": {"input_tokens": 1}, "ms": 5,
+        "error": '{"message":"Your credit balance is too low"}', "model": "x"})
+    r2 = client.post("/api/v1/ai/vision", json={**body, "mode": "general"}, headers=h_a)
+    assert r2.status_code == 200 and r2.json()["ok"] is True
+    assert "credit" not in r2.text and "balance" not in r2.text
+    last = client.get("/api/v1/ai/vision/last", headers=h_a).json()["last"]
+    assert last["error"] == "proveedor" and "credit" not in r2.text
+    cfg = client.get("/api/v1/ai/vision/config", headers=h_a).json()
+    assert "models" in cfg and "breaker_open" not in cfg
+
+
+def test_style_params_degrade_when_model_rejects_them(cvenv, monkeypatch):
+    """Si el modelo no acepta speed/thinking/effort, se reintenta sin ellos."""
+    calls, st = cvenv
+    queue = [
+        _Resp(400, {"type": "error", "error": {"type": "invalid_request_error",
+                   "message": "'claude-haiku-5-5' does not support the `speed` parameter."}}),
+        _ok({"tipo": "objeto", "titulo": "taza", "confidence": "alto"}),
+    ]
+
+    def post(*a, **k):
+        calls.append(k)
+        return queue.pop(0)
+
+    monkeypatch.setattr(cv.requests, "post", post)
+    r = cv.analyze(b"deg1", mode="general",
+                   opts=cv.CallOpts(model="claude-haiku-5-5", speed="fast", thinking="auto", effort="low"))
+    assert r["titulo"] == "taza"
+    info = cv.last_call_info()
+    assert info["attempts"] == 2 and "speed" in (info.get("degraded") or [])
+    assert info["http_status"] == 200
+    # primer body llevaba speed; el reintento ya no
+    assert calls[0]["json"].get("speed") == "fast"
+    assert "speed" not in calls[1]["json"]
+
+
+# ── Barrera de creación: render / foto IA no crea pieza ─────────────────────
+
+
+def _fp_read(**over):
+    base = {
+        "es_diecast": True, "es_foto_real": True, "brand": "Mini GT",
+        "casting": "AlphaTauri F1", "modelo": None, "color": "blanco",
+        "dorsal": None, "livery": "blanco con detalles negros", "texto": None,
+        "toy_number": None, "serie": None, "year": 2022, "confidence": "alto",
+    }
+    base.update(over)
+    return base
+
+
+def test_gate_create_rejects_render_or_ai_image():
+    # foto IA / render: es_foto_real False
+    assert aic.gate_create(_fp_read(es_foto_real=False)) == "not_foto_real"
+    # sin campo: los modelos viejos no lo devuelven → no crea
+    r = _fp_read()
+    r.pop("es_foto_real")
+    assert aic.gate_create(r) == "not_foto_real"
+
+
+def test_gate_create_rejects_without_identity_anchor():
+    # solo brand+casting+livery, sin texto/toy/serie → no crea (el caso AlphaTauri)
+    assert aic.gate_create(_fp_read()) == "no_anchor"
+    # livery con texto no basta: el ancla es texto EMPEZADO/legible o toy/serie
+    assert aic.gate_create(_fp_read(livery="rojo")) == "no_anchor"
+
+
+def test_gate_create_accepts_real_piece_with_text():
+    assert aic.gate_create(_fp_read(texto="Moon Equipment Co. 14+")) is None
+    assert aic.gate_create(_fp_read(texto=None, toy_number="MGT00777")) is None
+    assert aic.gate_create(_fp_read(texto=None, serie="Super GT")) is None
+
+
+def test_gate_create_still_rejects_non_diecast_and_low_conf():
+    assert aic.gate_create(_fp_read(es_diecast=False, texto="x1234")) == "no_diecast"
+    assert aic.gate_create(_fp_read(confidence="medio", texto="x1234")) == "low_confidence"
+    assert aic.gate_create(_fp_read(brand=None, texto="x1234")) == "missing_identity"
+
+
+def test_year_without_identity_anchor_is_dropped():
+    # sin toy/serie/texto el año lo inventa el modelo → cae
+    s = aic.sanitize_read(_fp_read(year=2022, texto=None, toy_number=None, serie=None))
+    assert s["year"] is None
+    # con ancla (texto legible) el año sobrevive
+    s2 = aic.sanitize_read(_fp_read(year=2022, texto="Mille Miglia 2022"))
+    assert s2["year"] == 2022
+    # con toy_number también
+    s3 = aic.sanitize_read(_fp_read(year=2019, texto=None, toy_number="MGT00001"))
+    assert s3["year"] == 2019
+
+
+def test_endpoint_render_is_rejected_not_created(rn, monkeypatch):
+    """Imagen IA con marca/casting pero sin ancla: rechazo, sin crear fila."""
+    rn["read"] = _fp_read()  # es_foto_real True pero sin ancla
+    _receipt()
+    j = _post().json()
+    assert j["method"] == "m" and j.get("item") is None
+    assert _db.variants.count_documents({"origin": "ai"}) == 0
+
+
+def test_endpoint_render_false_is_rejected(rn):
+    rn["read"] = _fp_read(es_foto_real=False, texto="AlphaTauri 2022")
+    _receipt()
+    j = _post().json()
+    assert j["method"] == "m" and j.get("item") is None
+    assert _db.variants.count_documents({"origin": "ai"}) == 0
+
+
+# ── Verificador pericial: segunda opinión contra renders ────────────────────
+
+
+def test_verify_real_object_parses_json(cvenv):
+    _, st = cvenv
+    st["resp"] = _ok({"fisico": True, "texto_leido": "MOON EQUIPMENT CO.", "marca_leido": "Mini GT", "casting_leido": "Datsun 620", "year_leido": None, "detalle": "blister Mini GT"})
+    v = cv.verify_real_object(b"v1")
+    assert v == {"fisico": True, "texto_leido": "MOON EQUIPMENT CO.", "marca_leido": "Mini GT", "casting_leido": "Datsun 620", "year_leido": None, "detalle": "blister Mini GT"}
+    st["resp"] = _ok({"fisico": False, "texto_leido": "", "detalle": "render 3D"})
+    v2 = cv.verify_real_object(b"v2")
+    assert v2["fisico"] is False
+
+
+def test_endpoint_render_fails_second_opinion(rn, monkeypatch):
+    """Lector dice que es real; el verificador dice render → no crea."""
+    rn["read"] = _fp_read(texto="AlphaTauri ATB1 #22, Yuki Tsunoda")  # pasa gate_create
+    monkeypatch.setattr(cv, "verify_real_object", lambda *a, **k: {"fisico": False, "texto_leido": "", "detalle": "render"})
+    _receipt()
+    j = _post().json()
+    assert j["method"] == "m" and j.get("item") is None
+    assert _db.variants.count_documents({"origin": "ai"}) == 0
+
+
+def test_endpoint_no_printed_text_drops_anchors(rn, monkeypatch):
+    """Verificador ve objeto físico pero sin texto impreso → anclas caen → no crea."""
+    rn["read"] = _fp_read(texto="AlphaTauri ATB1 #22, Yuki Tsunoda")
+    monkeypatch.setattr(cv, "verify_real_object", lambda *a, **k: {"fisico": True, "texto_leido": "", "detalle": "coche suelto sin texto"})
+    _receipt()
+    j = _post().json()
+    assert j["method"] == "m" and j.get("item") is None
+    assert _db.variants.count_documents({"origin": "ai"}) == 0
+
+
+def test_endpoint_real_piece_with_printed_text_creates(rn, monkeypatch):
+    rn["read"] = _fp_read(texto="MOON EQUIPMENT CO., PANDEM")
+    monkeypatch.setattr(cv, "verify_real_object", lambda *a, **k: {"fisico": True, "texto_leido": "MOON EQUIPMENT CO. PANDEM", "casting_leido": "AlphaTauri F1", "year_leido": None, "detalle": "taxi diecast con texto"})
+    _receipt()
+    j = _post().json()
+    assert j["method"] == "o" and j.get("item") is not None
+    assert _db.variants.count_documents({"origin": "ai"}) == 1
+
+
+def test_endpoint_verifier_down_fail_open_keeps_gate(rn, monkeypatch):
+    """Verificador caído → fail-open: decide gate_create (sin ancla no crea)."""
+    rn["read"] = _fp_read()  # sin ancla
+    monkeypatch.setattr(cv, "verify_real_object", lambda *a, **k: None)
+    _receipt()
+    j = _post().json()
+    assert j["method"] == "m" and j.get("item") is None
+    assert _db.variants.count_documents({"origin": "ai"}) == 0
+
+
+def test_text_agrees_between_reads():
+    # texto real citado por ambas lecturas → coincide
+    assert idn._text_agrees("MOON EQUIPMENT CO., PANDEM", "MOON EQUIPMENT CO.") is True
+    # texto alucinado que el verificador no ve → no coincide
+    assert idn._text_agrees("AlphaTauri ATB1 #22 Yuki Tsunoda", "") is False
+    # textos distintos entre llamadas → no coincide
+    assert idn._text_agrees("AlphaTauri Canadian Grand Prix", "render sin letras") is False
+    # sin texto reclamado no hay nada que contrastar
+    assert idn._text_agrees("", "") is True
+
+
+def test_endpoint_hallucinated_text_mismatch_rejected(rn, monkeypatch):
+    """Lector inventa texto de render; el verificador cita otro → anclas caen."""
+    rn["read"] = _fp_read(texto="AlphaTauri ATB1 #22, Yuki Tsunoda")
+    monkeypatch.setattr(cv, "verify_real_object", lambda *a, **k: {"fisico": True, "texto_leido": "solo un coche rojo", "detalle": "texto distinto"})
+    _receipt()
+    j = _post().json()
+    assert j["method"] == "m" and j.get("item") is None
+    assert _db.variants.count_documents({"origin": "ai"}) == 0
+
+
+def test_identity_agrees_catches_flapping_render():
+    read = _fp_read(casting="AlphaTauri AT02", year=2021)
+    # casting y año cambian entre lecturas → render alucinado
+    assert idn._identity_agrees(read, {"casting_leido": "AlphaTauri AT04", "year_leido": 2021}) is False
+    assert idn._identity_agrees(read, {"casting_leido": "AlphaTauri AT02", "year_leido": 2025}) is False
+    # pieza real: identidad estable
+    assert idn._identity_agrees(read, {"casting_leido": "AlphaTauri AT02", "year_leido": 2021}) is True
+    # sin dato en el verificador no hay conflicto
+    assert idn._identity_agrees(read, {"casting_leido": "", "year_leido": None}) is True
+
+
+def test_endpoint_flapping_identity_rejected(rn, monkeypatch):
+    """Render con texto coherente pero casting/año que cambian → no crea."""
+    rn["read"] = _fp_read(texto="ALPHATAURI MINI GT 22", casting="AlphaTauri AT02", year=2021)
+    monkeypatch.setattr(cv, "verify_real_object", lambda *a, **k: {
+        "fisico": True, "texto_leido": "MINI GT SCUDERIA ALPHATAURI 22",
+        "casting_leido": "AlphaTauri AT04", "year_leido": 2025, "detalle": "render"})
+    _receipt()
+    j = _post().json()
+    assert j["method"] == "m" and j.get("item") is None
+    assert _db.variants.count_documents({"origin": "ai"}) == 0
+
+
+def test_medium_confidence_rescued_by_agreeing_verifier(rn, monkeypatch):
+    """Lectura «medio» + verificador físico y coincidente → se crea."""
+    rn["read"] = _fp_read(confidence="medio", texto="MOON EQUIPMENT CO., PANDEM")
+    monkeypatch.setattr(cv, "verify_real_object", lambda *a, **k: {
+        "fisico": True, "texto_leido": "MOON EQUIPMENT CO. PANDEM",
+        "casting_leido": "AlphaTauri F1", "year_leido": None, "detalle": "diecast real"})
+    _receipt()
+    j = _post().json()
+    assert j["method"] == "o" and j.get("item") is not None
+
+
+def test_medium_confidence_not_rescued_without_verifier(rn, monkeypatch):
+    rn["read"] = _fp_read(confidence="medio", texto="MOON EQUIPMENT CO., PANDEM")
+    monkeypatch.setattr(cv, "verify_real_object", lambda *a, **k: None)
+    _receipt()
+    j = _post().json()
+    assert j["method"] == "m" and j.get("item") is None
+
+
+# ── Bug: master sin nombre → alta fallida tras insertar (respuesta manual) ──
+
+
+def test_gate_identity_checked_before_confidence():
+    """'medio' SIN marca ni modelo es missing_identity (no rescatable)."""
+    r = _read(brand=None, casting=None, confidence="medio")
+    assert aic.gate_read(r) == "missing_identity"
+    assert aic.gate_create(r) == "missing_identity"
+    # identidad incompleta también es missing_identity (antes de mirar confianza)
+    assert aic.gate_read(_read(casting=None, confidence="medio")) == "missing_identity"
+
+
+def test_create_new_master_never_missing_name_or_manufacturer(aienv):
+    out = aic.create_from_read(_db, "u1", _read(brand="Mini GT", casting="Datsun 620",
+                                                livery="Taxi Moon"), PHOTO)
+    doc = _db.variants.find_one({"_id": out["id"]})
+    m = _db.items.find_one({"_id": as_oid(doc["item_master_id"])})
+    assert m.get("name") and m.get("manufacturer")
+    assert out.get("item_master", {}).get("name")
+
+
+def test_piece_out_survives_broken_master(aienv):
+    doc = {"_id": "v1", "id": "v1", "variant_name": "X", "toy_number": None,
+           "main_image_url": None, "images": [], "body_color": None,
+           "item_master_id": "m1"}
+    out = aic._piece_out(doc, {"id": "m1"}, created=True)  # master sin name
+    assert out["id"] == "v1" and out["created"] is True
+
+
+def test_endpoint_rescue_does_not_bypass_identity(rn, monkeypatch):
+    """Sin NINGUNA fuente de modelo (verificador, modelo, livery): no crea."""
+    rn["read"] = _read(brand=None, casting=None, confidence="medio", modelo=None, livery=None,
+                       texto="MOON EQUIPMENT CO.")
+    monkeypatch.setattr(cv, "verify_real_object", lambda *a, **k: {
+        "fisico": True, "texto_leido": "MOON EQUIPMENT CO.", "casting_leido": "",
+        "year_leido": None, "detalle": "ok"})
+    _receipt()
+    j = _post().json()
+    assert j["method"] == "m" and j.get("item") is None
+    assert _db.variants.count_documents({"origin": "ai"}) == 0
+
+
+def test_missing_identity_never_filled_or_rescued(rn, monkeypatch):
+    """Sin marca ni modelo del LECTOR se rechaza: no se rellena ni se suple."""
+    rn["read"] = _read(brand=None, casting=None, confidence="alto",
+                       texto="MOON EQUIPMENT CO., PANDEM")
+    monkeypatch.setattr(cv, "verify_real_object", lambda *a, **k: {
+        "fisico": True, "texto_leido": "MOON EQUIPMENT CO. PANDEM",
+        "marca_leido": "Mini GT", "casting_leido": "Datsun 620",
+        "year_leido": None, "detalle": "diecast real"})
+    _receipt()
+    j = _post().json()
+    assert j["method"] == "m" and j.get("item") is None
+    assert _db.variants.count_documents({"origin": "ai"}) == 0
+
+
+def test_missing_identity_not_rescued_without_any_casting_source(rn, monkeypatch):
+    rn["read"] = _read(brand=None, casting=None, confidence="alto", modelo=None, livery=None,
+                       texto="MOON EQUIPMENT CO., PANDEM")
+    monkeypatch.setattr(cv, "verify_real_object", lambda *a, **k: {
+        "fisico": True, "texto_leido": "MOON EQUIPMENT CO. PANDEM",
+        "marca_leido": "Mini GT", "casting_leido": "",
+        "year_leido": None, "detalle": "sin modelo"})
+    _receipt()
+    j = _post().json()
+    assert j["method"] == "m" and j.get("item") is None
+    assert _db.variants.count_documents({"origin": "ai"}) == 0
+
+
+
+def test_second_paid_call_reserves_against_cap(rn, monkeypatch):
+    """La verificación es otra lectura pagada: si el tope no da, no se crea."""
+    reserves = []
+
+    def fake_reserve(db, uid):
+        reserves.append(1)
+        return len(reserves) == 1  # solo la 1ª (lectura) pasa
+
+    monkeypatch.setattr(aic, "reserve_ai_call", fake_reserve)
+    rn["read"] = _fp_read(texto="MOON EQUIPMENT CO., PANDEM")
+    monkeypatch.setattr(cv, "verify_real_object", lambda *a, **k: {
+        "fisico": True, "texto_leido": "MOON EQUIPMENT CO. PANDEM",
+        "marca_leido": "Mini GT", "casting_leido": "AlphaTauri F1",
+        "year_leido": None, "detalle": "ok"})
+    _receipt()
+    j = _post().json()
+    assert j["method"] == "m" and j.get("item") is None
+    assert len(reserves) == 2
+    assert _db.variants.count_documents({"origin": "ai"}) == 0
+
+
+def test_resolve_new_ignores_client_style_fields(rn, monkeypatch):
+    """model/speed/thinking del cliente no se usan: los fija el servidor."""
+    seen = {}
+    real = cv.read_for_catalog
+
+    def spy(data, timeout_s=None, opts=None):
+        seen["opts"] = opts
+        return _fp_read(texto="MOON EQUIPMENT CO., PANDEM")
+
+    monkeypatch.setattr(cv, "read_for_catalog", spy)
+    monkeypatch.setattr(cv, "verify_real_object", lambda *a, **k: {
+        "fisico": True, "texto_leido": "MOON EQUIPMENT CO. PANDEM",
+        "marca_leido": "Mini GT", "casting_leido": "AlphaTauri F1",
+        "year_leido": None, "detalle": "ok"})
+    _receipt()
+    import base64 as _b64
+    j = _client.post(_URL, json={
+        "image_base64": _b64.b64encode(PHOTO).decode(),
+        "model": "claude-opus-5-5", "speed": "fast",
+        "thinking": "extended", "effort": "max",
+    }).json()
+    assert j["method"] == "o" and j.get("item") is not None
+    assert seen["opts"] is None  # nada del cliente llega a la llamada

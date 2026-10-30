@@ -1097,7 +1097,12 @@ async def identify_b64(
 
 
 class ResolveNewIn(BaseModel):
-    """Foto ya escaneada (mismo formato que `/identify/base64`)."""
+    """Foto ya escaneada (mismo formato que `/identify/base64`).
+
+    El modelo, la velocidad y el pensamiento los fija el SERVIDOR (entorno).
+    El cliente no los elige: cada combinación distinta salta la caché y
+    multiplica el gasto.
+    """
 
     image_base64: str
 
@@ -1143,23 +1148,124 @@ def _valid_receipt(db, uid: str, ihash: str) -> dict | None:
     return None
 
 
-def _read_and_gate(data: bytes, receipt: dict) -> tuple[str | None, dict | None]:
+# Presupuesto del resolve-new: la app lo abandona a los 15 s. Lectura + verificación
+# caben con margen; si se pasa, se rechaza en vez de crear a ciegas.
+_RESOLVE_READ_TIMEOUT_S = 8.0
+_RESOLVE_VERIFY_TIMEOUT_S = 5.0
+_RESOLVE_BUDGET_S = 11.0
+
+
+def _read_and_gate(
+    data: bytes,
+    receipt: dict,
+    opts: "claude_vision.CallOpts | None" = None,
+    db=None,
+    uid: str | None = None,
+) -> tuple[str | None, dict | None]:
     """(motivo de rechazo o None, lectura). Red, sin CPU: va FUERA de `_IDENTIFY_SLOTS`.
-    La barrera del recibo ya pasó antes de llegar aquí (sin coste)."""
+    La barrera del recibo ya pasó antes de llegar aquí (sin coste).
+
+    La lectura y la verificación son DOS llamadas pagadas: ambas cuentan contra
+    el tope (`reserve_ai_call`). Sin marca ni modelo reconocibles se rechaza;
+    NO se rellena con «Desconocido».
+    """
+    t0 = time.monotonic()
     try:
-        read = claude_vision.read_for_catalog(data)
+        read = claude_vision.read_for_catalog(data, timeout_s=_RESOLVE_READ_TIMEOUT_S, opts=opts)
     except Exception:  # noqa: BLE001
         read = None
     if read is None:
         return "no_ai", None
-    reason = ai_catalog.gate_read(read)
-    if reason:
-        return f"rejected:{reason}", read
     clean = ai_catalog.sanitize_read(read)
     if clean is None:
         # URL o marcado en un campo guardable: rechazo (la lectura se pagó).
         return "rejected:unsafe_text", read
-    return None, clean
+    read = clean
+    # Creación: barrera estricta (foto física + ancla de identidad + marca/modelo).
+    reason = ai_catalog.gate_create(read)
+    needs_rescue = reason == "low_confidence"
+    if reason and not needs_rescue:
+        print(f"[ai-catalog] rechazo {reason}", flush=True)
+        return f"rejected:{reason}", read
+    # Segunda opinión pericial (otra llamada pagada): el lector alucina en renders.
+    if time.monotonic() - t0 > _RESOLVE_BUDGET_S:
+        print("[ai-catalog] rechazo timeout (presupuesto agotado)", flush=True)
+        return "rejected:timeout", read
+    if db is not None and uid is not None:
+        try:
+            if not ai_catalog.reserve_ai_call(db, uid):
+                print("[ai-catalog] rechazo call_cap (verificación)", flush=True)
+                return "rejected:call_cap", read
+        except Exception:  # noqa: BLE001
+            return "rejected:call_cap", read
+    verdict = None
+    try:
+        verdict = claude_vision.verify_real_object(data, opts, timeout_s=_RESOLVE_VERIFY_TIMEOUT_S)
+    except Exception:  # noqa: BLE001
+        verdict = None
+    if verdict is None:
+        # Fail-open solo si la lectura ya era «alto»; con rescate pendiente, sin
+        # verificador no hay creación.
+        if needs_rescue:
+            print(f"[ai-catalog] rechazo {reason} (sin verificador)", flush=True)
+            return f"rejected:{reason}", read
+    elif verdict.get("fisico") is not True:
+        print(f"[ai-catalog] rechazo not_foto_real ({verdict.get('detalle')})", flush=True)
+        return "rejected:not_foto_real", read
+    else:
+        quoted = verdict.get("texto_leido") or ""
+        claimed = str(read.get("texto") or "")
+        if not _text_agrees(claimed, quoted) or not _identity_agrees(read, verdict):
+            stripped = dict(read)
+            stripped["texto"] = None
+            stripped["toy_number"] = None
+            stripped["serie"] = None
+            stripped["year"] = None
+            reason = ai_catalog.gate_create(stripped)
+            print(f"[ai-catalog] rechazo {reason} (texto/identidad no coincide)", flush=True)
+            if reason:
+                return f"rejected:{reason}", read
+            read = stripped
+    return None, read
+
+
+def _text_agrees(claimed: str, quoted: str, min_overlap: float = 0.3) -> bool:
+    """¿El texto que reclama la lectura se parece al que el verificador ve?
+
+    Dos lecturas independientes de letras realmente impresas coinciden en las
+    palabras clave. El texto alucinado en un render cambia entre llamadas.
+    Sin texto reclamado no hay nada que contrastar (cada ancla se decide por
+    su cuenta). Con texto reclamado y verificador sin ver nada → no coincide.
+    """
+    def toks(s: str) -> set[str]:
+        return {t for t in re.findall(r"[a-z0-9]{3,}", (s or "").lower())}
+
+    a, b = toks(claimed), toks(quoted)
+    if not a:
+        return True
+    if not b:
+        return False
+    inter = len(a & b)
+    return inter / min(len(a), len(b)) >= min_overlap
+
+
+def _identity_agrees(read: dict, verdict: dict) -> bool:
+    """¿La identidad se mantiene entre el lector y el verificador?
+
+    Un render cambia de casting y de año entre llamadas («AT01», «AT04»,
+    2020, 2025…). Una pieza real se mantiene. Conflicto → no crear.
+    """
+    y1, y2 = read.get("year"), verdict.get("year_leido")
+    if isinstance(y1, int) and isinstance(y2, int) and y1 != y2:
+        return False
+    c1 = str(read.get("casting") or "").strip()
+    c2 = str(verdict.get("casting_leido") or "").strip()
+    if not c1 or not c2:
+        return True
+    n1 = re.sub(r"[^a-z0-9]", "", c1.lower())
+    n2 = re.sub(r"[^a-z0-9]", "", c2.lower())
+    # Iguales o uno contenido en el otro («Skyline GT-R» vs «Nissan Skyline GT-R R34»).
+    return n1 == n2 or n1 in n2 or n2 in n1
 
 
 def _mark_ai_tried(db, receipt: dict) -> None:
@@ -1249,7 +1355,10 @@ async def identify_resolve_new(
         _log.info("ai_catalog call_cap user=%s", uid)
         return IdentifyOut()
     # La lectura espera a la red: fuera del semáforo para no frenar los identify.
-    decision, read = await asyncio.to_thread(_read_and_gate, data, receipt)
+    # Modelo/velocidad/pensamiento: los fija el servidor (entorno), no el cliente.
+    decision, read = await asyncio.to_thread(
+        _read_and_gate, data, receipt, None, db, uid
+    )
     piece = None
     if decision is None:
         decision, piece = await _create_piece(db, uid, read, data, receipt)

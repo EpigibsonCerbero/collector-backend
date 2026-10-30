@@ -18,7 +18,7 @@ from fastapi.responses import FileResponse, Response, StreamingResponse
 
 from app.config import get_settings
 from app.db import ensure_indexes, get_db, ping
-from app.routers import alerts, auth, catalog, challenges, community, decide, garage, identify, leaderboard, lists, market, missions, notifications, shipping, social, stats, subscription, trading, uploads
+from app.routers import ai, alerts, auth, catalog, challenges, community, decide, garage, identify, leaderboard, lists, market, missions, notifications, shipping, social, stats, subscription, trading, uploads
 from app.services.seed import run_seed
 from app.services.vision import warmup as warmup_vision
 
@@ -73,6 +73,7 @@ def create_app() -> FastAPI:
     app.include_router(auth.me_router, prefix=api)
     app.include_router(catalog.router, prefix=api)
     app.include_router(identify.router, prefix=api)
+    app.include_router(ai.router, prefix=api)
     app.include_router(decide.router, prefix=api)
     app.include_router(decide.curate_router, prefix=api)
     app.include_router(garage.router, prefix=api)
