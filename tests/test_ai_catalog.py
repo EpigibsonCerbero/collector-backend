@@ -773,3 +773,71 @@ def test_upsert_dedupe_id_race_returns_existing():
     v, _m, created = _catr._upsert_catalog_piece(Db(), master, {"id": "race1", "variant_name": "Y"}, "u2",
                                                   dedupe_id=True)
     assert created is False and v["_id"] == "race1" and _db.variants.count_documents({}) == 1
+
+
+# ── Task 3, ronda 2: crear solo ante diferencia CLARA
+
+
+def _snapshot(aienv):
+    return (_rows(), _db.items.count_documents({}), len(aienv["appends"]),
+            len(list(_upl.UPLOAD_DIR.iterdir())))
+
+
+@pytest.mark.parametrize("dorsals", [(None, None), ("23", None), (None, "23"), ("23", "#23")])
+def test_strong_livery_color_mismatch_is_duplicate(aienv, dorsals):
+    a = aic.create_from_read(_db, "u1", _read(casting="Honda NSX", livery="Advan", color="blanco",
+                                               dorsal=dorsals[0]), PHOTO)
+    before = _snapshot(aienv)
+    r2 = _read(casting="Honda NSX", livery="ADVAN racing", color="rojo", dorsal=dorsals[1])
+    assert aic.make_source_id(r2) != aic.make_source_id(_read(casting="Honda NSX", livery="Advan",
+                                                              dorsal=dorsals[0]))  # pasa por el veredicto
+    b = aic.create_from_read(_db, "u2", r2, PHOTO)
+    assert b["outcome"] == "duplicate" and b["reason"] == "same_casting_livery" and b["id"] == a["id"]
+    assert _snapshot(aienv) == before
+
+
+def test_disjoint_livery_color_one_side_is_uncertain(aienv):
+    _seed_variant(toy="MGT09999", variant_name="Gulf")  # scrape: sin color guardado
+    before = _snapshot(aienv)
+    out = aic.create_from_read(_db, "u1", _read(livery="Azul celeste con naranja", color="azul"), PHOTO)
+    assert out["outcome"] == "uncertain" and out["reason"] == "same_casting_ambiguous"
+    assert _snapshot(aienv) == before
+
+
+def test_disjoint_livery_colors_differ_is_created(aienv):
+    _seed_variant(toy="MGT09999", variant_name="Gulf")
+    _db.variants.update_one({"_id": "exist1"}, {"$set": {"body_color": "Red"}})
+    out = aic.create_from_read(_db, "u1", _read(livery="Martini", color="blanco"), PHOTO)
+    assert out["outcome"] == "created" and _rows() == 2
+
+
+def test_disjoint_livery_no_colors_dorsal_differs_is_created(aienv):
+    _seed_variant(toy="MGT09999", variant_name="Gulf")
+    _db.variants.update_one({"_id": "exist1"}, {"$set": {"livery_number": "7"}})
+    out = aic.create_from_read(_db, "u1", _read(livery="Martini", color=None, dorsal="#8"), PHOTO)
+    assert out["outcome"] == "created" and _rows() == 2
+
+
+def test_strong_livery_dorsal_conflict_is_created(aienv):
+    a = aic.create_from_read(_db, "u1", _read(casting="Honda NSX", livery="Advan", color="blanco", dorsal="23"), PHOTO)
+    b = aic.create_from_read(_db, "u1", _read(casting="Honda NSX", livery="Advan", color="rojo", dorsal="#24"), PHOTO)
+    assert b["outcome"] == "created" and b["id"] != a["id"] and _rows() == 2
+
+
+def test_no_livery_dorsal_or_color_differs_is_uncertain(aienv):
+    aic.create_from_read(_db, "u1", _read(livery=None, color="rojo", dorsal="5"), PHOTO)
+    before = _snapshot(aienv)
+    assert aic.create_from_read(_db, "u2", _read(livery=None, color="rojo", dorsal="6"), PHOTO)["outcome"] == "uncertain"
+    assert aic.create_from_read(_db, "u2", _read(livery=None, color="verde", dorsal="5"), PHOTO)["outcome"] == "uncertain"
+    assert _snapshot(aienv) == before
+
+
+def test_same_casting_scan_cap_is_uncertain(aienv, monkeypatch):
+    monkeypatch.setattr(aic, "SAME_CASTING_SCAN_LIMIT", 2)
+    for i in range(2):
+        _db.items.insert_one({"_id": f"mcap{i}", "name": f"Nissan Skyline GT-R R34 {i}", "manufacturer": "Inno64",
+                              "release_year": 2020})
+    before = _snapshot(aienv)
+    out = aic.create_from_read(_db, "u1", _read(), PHOTO)
+    assert out["outcome"] == "uncertain" and out["reason"] == "same_casting_scan_capped"
+    assert _snapshot(aienv) == before

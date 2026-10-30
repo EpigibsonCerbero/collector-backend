@@ -239,13 +239,21 @@ def _dorsal(v) -> str | None:
 
 def _livery_verdict(read: dict, doc: dict) -> str:
     """"match" | "conflict" | "ambiguous" entre la lectura y una variante del
-    mismo casting. Solo "match" con evidencia fuerte; la duda es "ambiguous".
+    mismo casting. La duda es "ambiguous" (no se crea): un duplicado es peor
+    que una pieza que falta.
+
+    - livery fuerte (núcleos ≥ 0.6): "match", salvo dorsal distinto ("conflict").
+      El color no cuenta: la IA nombra distinto el color dominante de un livery
+      multicolor.
+    - liveries disjuntos: "conflict" solo si además hay color en AMBOS lados y
+      difiere, o el dorsal difiere; si no, "ambiguous".
+    - ninguno trae livery: "match" si colores (ambos) y dorsal coinciden.
+    - todo lo demás: "ambiguous".
 
     El livery se compara sin palabras de color (la IA dice «azul», el scrape
     «Blue»); el color va aparte, canonizado es/en."""
     rd, dd = _dorsal(read.get("dorsal")), _dorsal(doc.get("livery_number"))
-    if rd and dd and rd != dd:
-        return "conflict"
+    dorsal_conflict = bool(rd and dd and rd != dd)
     rl = _toks(read.get("livery"))
     if doc.get("livery_desc"):
         dl = _toks(doc.get("livery_desc"))
@@ -255,41 +263,48 @@ def _livery_verdict(read: dict, doc: dict) -> str:
         dl = set()  # pieza IA sin livery: su variant_name es color o casting
     rc = _colors(read.get("color"), read.get("livery"))
     dc = _colors(doc.get("body_color"), doc.get("livery_color"), " ".join(dl))
-    color_conflict = bool(rc and dc and not (rc & dc))
-    if color_conflict:
-        return "conflict"
+    color_diff = bool(rc and dc and not (rc & dc))
     rcore = {t for t in rl if t not in _COLORS}
     dcore = {t for t in dl if t not in _COLORS}
     if rcore and dcore:
         inter = rcore & dcore
         if inter and len(inter) / min(len(rcore), len(dcore)) >= _LIVERY_MATCH:
-            return "match"
-        if not inter and not (rc and dc):
-            return "conflict"  # nombres de livery distintos y sin color que los acerque
+            return "conflict" if dorsal_conflict else "match"
+        if not inter and (color_diff or dorsal_conflict):
+            return "conflict"
         return "ambiguous"
-    if not rl and not dl and rc and dc and rd == dd:
+    if not rl and not dl and rc and dc and not color_diff and rd == dd:
         return "match"  # ninguna trae livery, los colores y el dorsal coinciden
     return "ambiguous"
 
 
-def _same_casting_variants(db, read: dict, limit: int = 500) -> list[dict]:
-    """Variantes de la MISMA marca cuyo casting coincide con la lectura."""
+# Tope de documentos que revisa la búsqueda por casting. Si se alcanza, la
+# comprobación no es concluyente → «incierto».
+SAME_CASTING_SCAN_LIMIT = 500
+
+
+def _same_casting_variants(db, read: dict) -> tuple[list[dict], bool]:
+    """(variantes de la MISMA marca cuyo casting coincide, tope alcanzado)."""
+    limit = SAME_CASTING_SCAN_LIMIT
     slug = _brand_slug(read.get("brand"))
     ct = _casting_toks(read)
     if not ct:
-        return []
+        return [], False
     anchor = max(sorted(ct), key=len)  # determinista
     rx = {"$regex": re.escape(anchor), "$options": "i"}
+    masters = list(db.items.find({"$or": [{"name": rx}, {"casting_name": rx}]}).limit(limit))
+    capped = len(masters) >= limit
     mids = []
-    for m in db.items.find({"$or": [{"name": rx}, {"casting_name": rx}]}).limit(limit):
+    for m in masters:
         if _brand_slug(m.get("manufacturer")) != slug:
             continue
         mt = _casting_toks(m.get("casting_name") or m.get("name"), m.get("manufacturer"))
         if _casting_match(ct, mt):
             mids.append(str(m["_id"]))
     if not mids:
-        return []
-    return list(db.variants.find({"item_master_id": {"$in": mids}}).limit(limit))
+        return [], capped
+    variants = list(db.variants.find({"item_master_id": {"$in": mids}}).limit(limit))
+    return variants, capped or len(variants) >= limit
 
 
 def check_duplicate(db, read: dict, crop_vec: list[float] | None) -> DupCheck:
@@ -324,10 +339,13 @@ def check_duplicate(db, read: dict, crop_vec: list[float] | None) -> DupCheck:
         if hits:
             return DupCheck("uncertain", "toy_name_mismatch")
 
-    verdicts = [(_livery_verdict(read, v), v) for v in _same_casting_variants(db, read)]
+    same, capped = _same_casting_variants(db, read)
+    verdicts = [(_livery_verdict(read, v), v) for v in same]
     for verdict, v in verdicts:
         if verdict == "match":
             return dup(v, "same_casting_livery")
+    if capped:
+        return DupCheck("uncertain", "same_casting_scan_capped")
     if any(verdict == "ambiguous" for verdict, _ in verdicts):
         return DupCheck("uncertain", "same_casting_ambiguous")
 
@@ -352,7 +370,8 @@ def check_duplicate(db, read: dict, crop_vec: list[float] | None) -> DupCheck:
 
 def find_duplicate(db, read: dict, crop_vec: list[float] | None) -> dict | None:
     """Pieza existente o None. OJO: None NO significa «se puede crear» (puede
-    ser incierto); para decidir el alta usar `check_duplicate`."""
+    ser incierto). Para decidir un alta (Task 5) usar `check_duplicate` o
+    `create_from_read`, que distinguen duplicate / uncertain / new."""
     return check_duplicate(db, read, crop_vec).piece
 
 
