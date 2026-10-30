@@ -3257,3 +3257,40 @@ def test_m3_clock_passes_between_second_slot_and_create_new(rn, aienv, clk, monk
     assert log == [] and slots.n == 2 and slots.released == 2  # create_new nunca arrancó
     assert "ai_catalog uncertain:timeout user=u1" in caplog.text
     _assert_nothing_written(aienv, before)
+
+
+# M4: texto truncado con presupuesto recortado por el reloj = incierto (timeout),
+# nunca «nuevo», y el recibo queda reintentable (sin `ai_tried`).
+
+
+@pytest.mark.parametrize("budget", [2.5, 0.5])
+def test_m4_truncated_with_trimmed_budget_is_timeout(aienv, budget):
+    aienv["truncate"] = True
+    chk = aic.check_duplicate(_db, _read(), None, text_budget_s=budget)
+    assert (chk.outcome, chk.reason) == ("uncertain", "timeout")
+
+
+def test_m4_slow_text_search_with_trimmed_budget_is_timeout(aienv, monkeypatch):
+    c = {"t": 0.0}
+    monkeypatch.setattr(aic, "_clock", lambda: c["t"])
+    real = _vis.search_catalog_by_text
+
+    def slow(q, top_k=8, budget_s=2.0, stats=None):
+        c["t"] += budget_s  # agota su presupuesto sin marcar `truncated`
+        return real(q, top_k=top_k, budget_s=budget_s, stats=stats)
+
+    monkeypatch.setattr(_vis, "search_catalog_by_text", slow)
+    chk = aic.check_duplicate(_db, _read(), None, text_budget_s=1.0)
+    assert (chk.outcome, chk.reason) == ("uncertain", "timeout")
+
+
+def test_m4_endpoint_truncated_trimmed_budget_keeps_receipt_retryable(rn, aienv, clk, monkeypatch, caplog):
+    aienv["truncate"] = True
+    _slow(clk, monkeypatch, "prepare_image", 9.0)  # presupuesto de texto 2.5 s (< 3)
+    log = []
+    _slow(clk, monkeypatch, "create_new", 0.0, log)
+    before = _snapshot(aienv)
+    assert _is_manual(_q1_post(caplog))
+    assert aienv["text_calls"][0][1] == pytest.approx(2.5) and log == []
+    assert "ai_catalog uncertain:timeout user=u1" in caplog.text
+    _assert_nothing_written(aienv, before)
