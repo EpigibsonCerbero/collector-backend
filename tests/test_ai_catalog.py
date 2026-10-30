@@ -1856,3 +1856,63 @@ def test_call_caps_default_values():
     st = get_settings()
     assert st.ai_catalog_daily_ai_calls == 30 and st.ai_catalog_global_daily_calls == 500
     assert st.ai_catalog_daily_cap == 10  # el tope de altas sigue igual
+
+
+# ── Revisión final I7: texto libre del modelo saneado antes de guardarse ────
+
+
+def test_sanitize_read_cleans_and_caps():
+    r = aic.sanitize_read(_read(casting="  Nissan\x00\tSkyline \n GT-R  ", livery="L" * 500,
+                                brand="B" * 300, color="azul\x07", serie="S" * 300, dorsal="#23 > 1"))
+    assert r["casting"] == "Nissan Skyline GT-R"
+    assert len(r["livery"]) == 200 and len(r["brand"]) == 80 and len(r["serie"]) == 80
+    assert r["color"] == "azul" and r["dorsal"] == "#23 1"
+    assert r["es_diecast"] is True and r["confidence"] == "alto"
+
+
+@pytest.mark.parametrize("field,value", [
+    ("livery", "visit http://evil.example"), ("casting", "www.spam.com R34"), ("serie", "ftp://x"),
+    ("brand", "<script>alert(1)</script>"), ("color", "<b>azul</b>"), ("dorsal", "&lt;23"),
+])
+def test_sanitize_read_rejects_urls_and_markup(field, value):
+    assert aic.sanitize_read(_read(**{field: value})) is None
+
+
+def test_sanitize_read_ignores_unstored_texto():
+    # El texto del empaque (no se guarda) puede traer la web de la marca.
+    assert aic.sanitize_read(_read(texto="www.minigt.com 14+")) is not None
+
+
+def test_mgt_toy_out_of_range_is_ignored(aienv, monkeypatch):
+    assert get_settings().ai_catalog_mgt_max == 2000
+    r = aic.sanitize_read(_read(toy_number="MGT02500"))
+    assert r["toy_number"] is None
+    out = aic.create_from_read(_db, "u1", _read(toy_number="MGT09999"), PHOTO)
+    doc = _db.variants.find_one({"_id": out["id"]})
+    assert doc["toy_number"] is None and "toy_number" not in doc["metadata"]
+    assert aic._norm_toy(_read(toy_number="2000")) == "MGT02000"
+    assert aic._norm_toy(_read(toy_number="2001")) is None
+    # otras marcas: el número sigue siendo metadato
+    assert aic.sanitize_read(_read(brand="Hot Wheels", toy_number="9999"))["toy_number"] == "9999"
+
+
+def test_create_caps_variant_name_and_stores_clean_text(aienv):
+    out = aic.create_from_read(_db, "u1", _read(livery="Bayside " + "x" * 400), PHOTO)
+    doc = _db.variants.find_one({"_id": out["id"]})
+    assert len(doc["livery_desc"]) == 200 and len(doc["variant_name"]) == 150
+
+
+def test_create_rejects_unsafe_text_writes_nothing(aienv):
+    out = aic.create_from_read(_db, "u1", _read(livery="see https://x.y"), PHOTO)
+    assert out == {"outcome": "uncertain", "reason": "unsafe_text", "created": False}
+    assert _rows() == 0 and aienv["appends"] == []
+
+
+def test_endpoint_unsafe_text_is_gate_rejection(rn, caplog):
+    rn["read"] = _read(livery="<img src=x onerror=1>")
+    _receipt()
+    with caplog.at_level(_logging.INFO, logger=idn._log.name):
+        assert _is_manual(_post().json())
+    assert _rows() == 0 and len(rn["calls"]) == 1
+    assert _db.identify_receipts.find_one({})["ai_tried"] is True
+    assert "ai_catalog rejected:unsafe_text user=u1" in caplog.text

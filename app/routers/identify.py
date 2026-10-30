@@ -1144,7 +1144,13 @@ def _read_and_gate(data: bytes, receipt: dict) -> tuple[str | None, dict | None]
     if read is None:
         return "no_ai", None
     reason = ai_catalog.gate_read(read)
-    return (f"rejected:{reason}", read) if reason else (None, read)
+    if reason:
+        return f"rejected:{reason}", read
+    clean = ai_catalog.sanitize_read(read)
+    if clean is None:
+        # URL o marcado en un campo guardable: rechazo (la lectura se pagó).
+        return "rejected:unsafe_text", read
+    return None, clean
 
 
 def _mark_ai_tried(db, receipt: dict) -> None:

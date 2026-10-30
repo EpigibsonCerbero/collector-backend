@@ -38,6 +38,8 @@ class Settings(BaseSettings):
     # de emergencia del gasto). Se cuentan antes de cada lectura.
     ai_catalog_daily_ai_calls: int = 30
     ai_catalog_global_daily_calls: int = 500
+    # Rango válido del número Mini GT (MGT00001..). Fuera de rango se ignora.
+    ai_catalog_mgt_max: int = 2000
     ai_catalog_max_top_score: float = 0.75
     ai_catalog_receipt_ttl_s: int = 600
     # Barreras anti-duplicado (inclinadas a NO crear): cobertura del nombre de

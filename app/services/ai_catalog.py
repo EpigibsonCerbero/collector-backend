@@ -121,9 +121,51 @@ def _norm_toy(read: dict) -> str | None:
     if not raw or _brand_slug(read.get("brand")) not in _TOY_ID_BRANDS:
         return None
     m = re.fullmatch(r"(?:MGT)?0*(\d{1,5})", raw)
-    if not m or int(m.group(1)) == 0:
+    if not m or not 1 <= int(m.group(1)) <= get_settings().ai_catalog_mgt_max:
         return None
     return f"MGT{int(m.group(1)):05d}"
+
+
+# ── Saneado del texto libre del modelo ─────────────────────────────────────
+
+# Campos de la lectura que acaban en el catálogo (o en sus consultas) y su
+# longitud máxima. `texto` (todo el empaque) no se guarda: no se revisa.
+_TEXT_CAPS = {
+    "brand": 80, "casting": 80, "modelo": 80, "color": 80, "dorsal": 80,
+    "livery": 200, "serie": 80, "toy_number": 80,
+}
+VARIANT_NAME_MAX = 150
+_URL_RE = re.compile(r"https?|www\.|://", re.I)
+_MARKUP_RE = re.compile(r"<\s*/?\s*[a-z!?]|&(?:#\d+|#x[0-9a-f]+|[a-z]+);", re.I)
+_CTRL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def _clean_text(v, cap: int) -> str | None:
+    s = _CTRL_RE.sub(" ", str(v)).replace("<", " ").replace(">", " ")
+    s = re.sub(r"\s+", " ", s).strip()[:cap].strip()
+    return s or None
+
+
+def sanitize_read(read: dict | None) -> dict | None:
+    """Copia saneada de la lectura, o None si hay que rechazarla.
+
+    Rechazo (= barrera, no se crea nada): algún campo guardable trae algo con
+    forma de URL (`http`, `www.`, `://`) o de marcado HTML. Si no: sin
+    caracteres de control ni `<>`, espacios colapsados y longitudes tope.
+    Un número Mini GT fuera de 1..`ai_catalog_mgt_max` se ignora (None)."""
+    if not read:
+        return read
+    out = dict(read)
+    for k, cap in _TEXT_CAPS.items():
+        v = out.get(k)
+        if v is None:
+            continue
+        if _URL_RE.search(str(v)) or _MARKUP_RE.search(str(v)):
+            return None
+        out[k] = _clean_text(v, cap)
+    if out.get("toy_number") and _brand_slug(out.get("brand")) in _TOY_ID_BRANDS and _norm_toy(out) is None:
+        out["toy_number"] = None
+    return out
 
 
 def make_source_id(read: dict) -> str:
@@ -520,6 +562,9 @@ def create_from_read(db, user_id: str, read: dict, image_bytes: bytes) -> dict:
     from app.routers.catalog import _upsert_catalog_piece
     from app.services import car_segment, dinov2_embed
 
+    read = sanitize_read(read)
+    if read is None:
+        return {"outcome": "uncertain", "reason": "unsafe_text", "created": False}
     im = Image.open(io.BytesIO(image_bytes))
     im.load()
     im = im.convert("RGB")
@@ -560,7 +605,7 @@ def create_from_read(db, user_id: str, read: dict, image_bytes: bytes) -> dict:
     variant = {
         "id": vid,
         "ai_local_hash": "h" + hashlib.sha1(source_id.encode("utf-8")).hexdigest()[:24],
-        "variant_name": livery or color or casting,
+        "variant_name": (livery or color or casting or "")[:VARIANT_NAME_MAX].strip() or casting,
         "toy_number": toy,
         "main_image_url": url,
         "images": [url] if url else [],
