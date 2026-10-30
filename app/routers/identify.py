@@ -13,7 +13,10 @@ import re
 import unicodedata
 from typing import Any, Optional
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
+
+from app.ratelimit import client_ip, hit_or_429
+from app.security import CurrentUser, get_current_user
 from pydantic import BaseModel, Field
 
 from app.db import as_id, get_db, oid, serialize, serialize_many
@@ -797,8 +800,24 @@ def _run_identify(image_bytes: bytes, brand: str | None = None) -> IdentifyOut:
     return out
 
 
+# Abuso / estabilidad: el pipeline es CPU-bound (~1.5 s). Sin tope, unas pocas
+# peticiones en paralelo saturaban la VM y TODAS pasaban de 8 s. Se encolan de
+# 2 en 2 (latencia estable) y cada IP tiene un máximo por minuto.
+_IDENTIFY_SLOTS = asyncio.Semaphore(2)
+_MAX_IMAGE_BYTES = 12 * 1024 * 1024
+
+
+async def _identify_guarded(request: Request, data: bytes, brand: Optional[str]) -> IdentifyOut:
+    hit_or_429("identify", client_ip(request), limit=30, per_seconds=60)
+    if len(data) > _MAX_IMAGE_BYTES:
+        raise HTTPException(status_code=413, detail="Imagen muy grande (máx 12 MB)")
+    async with _IDENTIFY_SLOTS:
+        return await asyncio.to_thread(_run_identify, data, brand)
+
+
 @router.post("/identify", response_model=IdentifyOut)
 async def identify_upload(
+    request: Request,
     image: Optional[UploadFile] = File(default=None),
     image_base64: Optional[str] = Form(default=None),
     brand: Optional[str] = Form(default=None),
@@ -826,11 +845,11 @@ async def identify_upload(
 
     # En un thread: el event loop queda libre para el SSE de /lab/stream
     # mientras corre el pipeline (que es CPU-bound y largo).
-    return await asyncio.to_thread(_run_identify, data, brand)
+    return await _identify_guarded(request, data, brand)
 
 
 @router.post("/identify/base64", response_model=IdentifyOut)
-async def identify_b64(body: IdentifyBase64) -> IdentifyOut:
+async def identify_b64(body: IdentifyBase64, request: Request) -> IdentifyOut:
     """Alternativa JSON: { image_base64: '...' }."""
     raw = body.image_base64
     if "," in raw and raw.strip().startswith("data:"):
@@ -839,12 +858,19 @@ async def identify_b64(body: IdentifyBase64) -> IdentifyOut:
         data = base64.b64decode(raw)
     except Exception:
         raise HTTPException(status_code=400, detail="image_base64 inválido")
-    return await asyncio.to_thread(_run_identify, data, body.brand)
+    return await _identify_guarded(request, data, body.brand)
 
 
 @router.post("/identify/peritaje", response_model=PeritajeOut)
-async def identify_peritaje(body: PeritajeIn) -> PeritajeOut:
-    """Desempate de livery bajo demanda. Fail-open: devuelve pick=None."""
+async def identify_peritaje(
+    body: PeritajeIn,
+    user: CurrentUser = Depends(get_current_user),
+) -> PeritajeOut:
+    """Desempate de livery bajo demanda. Fail-open: devuelve pick=None.
+
+    Llama a un modelo de pago: exige sesión y tiene tope por usuario.
+    """
+    hit_or_429("peritaje", user.id, limit=10, per_seconds=600)
     try:
         data = base64.b64decode(body.image_base64.split(",", 1)[-1])
     except Exception:

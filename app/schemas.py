@@ -58,7 +58,9 @@ class ForgotPasswordResponse(BaseModel):
     """Sin SMTP configurado el código se entrega en la respuesta (self-hosted)."""
 
     ok: bool = True
-    delivery: Literal["in_response", "email"] = "in_response"
+    # "email": enviado por correo · "unavailable": correo sin configurar.
+    # El código JAMÁS viaja en la respuesta (cualquiera con el email tomaba la cuenta).
+    delivery: Literal["email", "unavailable"] = "email"
     reset_code: Optional[str] = None
     expires_in_min: int = 30
 
@@ -77,7 +79,7 @@ class MagicCodeResponse(BaseModel):
     """Self-hosted: sin SMTP el código de acceso se entrega en la respuesta."""
 
     ok: bool = True
-    delivery: Literal["in_response", "email"] = "in_response"
+    delivery: Literal["email", "unavailable"] = "email"
     code: Optional[str] = None
     expires_in_min: int = 10
 
@@ -85,6 +87,7 @@ class MagicCodeResponse(BaseModel):
 class MagicLoginRequest(BaseModel):
     email: EmailStr
     code: str = Field(min_length=4, max_length=12)
+    totp_code: Optional[str] = None
 
 
 # ── Catálogo: marcas / series / categorías ────────────────────────────────
@@ -388,6 +391,7 @@ class TransactionCreate(BaseModel):
     counterpart: Optional[str] = None
     notes: Optional[str] = None
     item_variant_id: Optional[str] = None
+    item_name: Optional[str] = Field(default=None, max_length=200)
 
 
 class TransactionOut(BaseModel):
@@ -398,6 +402,7 @@ class TransactionOut(BaseModel):
     counterpart: Optional[str] = None
     notes: Optional[str] = None
     item_variant_id: Optional[str] = None
+    item_name: Optional[str] = None
     created_at: Optional[str] = None
 
 

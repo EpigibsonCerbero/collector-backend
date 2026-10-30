@@ -19,7 +19,11 @@ class Settings(BaseSettings):
     access_ttl_min: int = 60
     refresh_ttl_days: int = 30
 
-    # Bootstrap admin (dev)
+    # Ids de usuario (coma) con permiso para editar el catálogo global.
+    admin_user_ids: str = ""
+
+    # Bootstrap admin (dev). Con la contraseña por defecto NO se crea y, si ya
+    # existe con ella, se desactiva al arrancar (estaba publicada en el repo).
     seed_admin_email: str = "admin@collector.local"
     seed_admin_password: str = "AdminDev123!"
     seed_admin_username: str = "admin"

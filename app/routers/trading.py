@@ -6,7 +6,10 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException
 from pymongo import DESCENDING, ReturnDocument
 
+from bson import ObjectId
+
 from app.db import get_db, oid, serialize
+from app.routers.alerts import notify
 from app.schemas_social import (
     EscrowStep,
     EscrowUpdate,
@@ -111,13 +114,23 @@ def create_offer(
 ) -> TradeOfferOut:
     if body.to_user_id == user.id:
         raise HTTPException(status_code=400, detail="No puedes ofrecerte a ti mismo")
+    db = get_db()
+    target = (
+        db.users.find_one({"_id": ObjectId(body.to_user_id)}, {"username": 1})
+        if ObjectId.is_valid(body.to_user_id)
+        else None
+    )
+    if not target:
+        raise HTTPException(status_code=404, detail="El destinatario no existe")
+    if not body.offered_items or not body.requested_items:
+        raise HTTPException(status_code=400, detail="La oferta necesita una pieza ofrecida y una pedida")
     now = _now()
     doc = {
         "from_user_id": user.id,
         "from_username": user.username,
         "from_avatar": body.from_avatar,
         "to_user_id": body.to_user_id,
-        "to_username": body.to_username,
+        "to_username": target.get("username", body.to_username),
         "to_avatar": "",
         "offered_items": [i.model_dump() for i in body.offered_items],
         "requested_items": [i.model_dump() for i in body.requested_items],
@@ -126,8 +139,11 @@ def create_offer(
         "created_at": now,
         "updated_at": now,
     }
-    res = get_db().trade_offers.insert_one(doc)
+    res = db.trade_offers.insert_one(doc)
     doc["_id"] = res.inserted_id
+    wanted = body.requested_items[0].variant_name
+    notify(db, body.to_user_id, "trade_offer", "Nueva oferta de canje",
+           f"@{user.username} te propone un canje por tu {wanted}.", "🔁")
     data = serialize(doc)
     assert data is not None
     data["type"] = "outgoing"
@@ -165,6 +181,8 @@ def accept_offer(
             "created_at": now,
         }
     )
+    notify(db, offer["from_user_id"], "trade_offer", "Oferta aceptada",
+           f"@{user.username} aceptó tu oferta. Coordinen el envío en el canje.", "✅")
     data = serialize(doc)
     assert data is not None
     data["type"] = "incoming"
@@ -180,14 +198,41 @@ def reject_offer(
     offer = db.trade_offers.find_one({"_id": oid(offer_id)})
     if not offer or offer.get("to_user_id") != user.id:
         raise HTTPException(status_code=404, detail="Oferta no encontrada")
+    if offer.get("status") != "pending":
+        raise HTTPException(status_code=409, detail=f"Oferta en estado {offer.get('status')}")
     doc = db.trade_offers.find_one_and_update(
         {"_id": oid(offer_id)},
         {"$set": {"status": "rejected", "updated_at": _now()}},
         return_document=ReturnDocument.AFTER,
     )
+    notify(db, offer["from_user_id"], "trade_offer", "Oferta rechazada",
+           f"@{user.username} rechazó tu oferta de canje.", "✖")
     data = serialize(doc)
     assert data is not None
     data["type"] = "incoming"
+    return TradeOfferOut(**data)
+
+
+@router.post("/offers/{offer_id}/cancel", response_model=TradeOfferOut)
+def cancel_offer(
+    offer_id: str,
+    user: CurrentUser = Depends(get_current_user),
+) -> TradeOfferOut:
+    """Quien ENVIÓ la oferta la retira mientras siga pendiente."""
+    db = get_db()
+    offer = db.trade_offers.find_one({"_id": oid(offer_id)})
+    if not offer or offer.get("from_user_id") != user.id:
+        raise HTTPException(status_code=404, detail="Oferta no encontrada")
+    if offer.get("status") != "pending":
+        raise HTTPException(status_code=409, detail=f"Oferta en estado {offer.get('status')}")
+    doc = db.trade_offers.find_one_and_update(
+        {"_id": oid(offer_id)},
+        {"$set": {"status": "cancelled", "updated_at": _now()}},
+        return_document=ReturnDocument.AFTER,
+    )
+    data = serialize(doc)
+    assert data is not None
+    data["type"] = "outgoing"
     return TradeOfferOut(**data)
 
 
@@ -204,7 +249,21 @@ def list_escrows(user: CurrentUser = Depends(get_current_user)) -> list[TradeEsc
         )
     ]
     docs = list(db.trade_escrows.find({"offer_id": {"$in": offer_ids}}).sort("created_at", DESCENDING))
-    return [TradeEscrowOut(**serialize(d)) for d in docs]  # type: ignore[arg-type]
+    return [_escrow_out(db, d, user.id) for d in docs]
+
+
+def _escrow_out(db, doc: dict, viewer_id: str) -> TradeEscrowOut:
+    """`partner_name` es LA CONTRAPARTE de quien mira (antes siempre el que ofertó)."""
+    data = serialize(doc)
+    assert data is not None
+    offer = db.trade_offers.find_one({"_id": oid(data["offer_id"])}) if ObjectId.is_valid(data["offer_id"]) else None
+    if offer:
+        mine_is_from = offer.get("from_user_id") == viewer_id
+        data["partner_name"] = offer.get("to_username" if mine_is_from else "from_username", "")
+        # Lo que YO recibo da nombre al canje.
+        recv = offer.get("requested_items" if mine_is_from else "offered_items") or [{}]
+        data["item_name"] = recv[0].get("variant_name", data.get("item_name", ""))
+    return TradeEscrowOut(**data)
 
 
 @router.patch("/escrows/{escrow_id}", response_model=TradeEscrowOut)
@@ -236,4 +295,11 @@ def update_escrow(
         {"$set": updates},
         return_document=ReturnDocument.AFTER,
     )
-    return TradeEscrowOut(**serialize(doc))  # type: ignore[arg-type]
+    other = offer["to_user_id"] if offer.get("from_user_id") == user.id else offer["from_user_id"]
+    if body.tracking_number and body.tracking_number != esc.get("tracking_number"):
+        notify(db, other, "trade_offer", "Pieza enviada",
+               f"@{user.username} envió su pieza. Guía: {body.tracking_number}", "📦")
+    elif body.status and body.status != esc.get("status") and body.status in ("delivered", "completed"):
+        notify(db, other, "trade_offer", "Canje actualizado",
+               f"@{user.username} confirmó la recepción de la pieza.", "✅")
+    return _escrow_out(db, doc, user.id)

@@ -61,6 +61,27 @@ def get_collection_stats(
     rare_count = 0
     valued: list[dict] = []
 
+    # Variantes y maestros en lote (antes 2 consultas POR pieza: lento con Atlas).
+    from app.db import as_id
+
+    def _keys(values) -> list:
+        out = []
+        for v in values:
+            try:
+                out.append(as_id(str(v)))
+            except Exception:  # noqa: BLE001
+                out.append(str(v))
+        return out
+
+    vids = {str(i["item_variant_id"]) for i in items if i.get("item_variant_id")}
+    variants_by_id = {
+        str(v["_id"]): v for v in db.variants.find({"_id": {"$in": _keys(vids)}})
+    } if vids else {}
+    mids = {str(v["item_master_id"]) for v in variants_by_id.values() if v.get("item_master_id")}
+    masters_by_id = {
+        str(m["_id"]): m for m in db.items.find({"_id": {"$in": _keys(mids)}})
+    } if mids else {}
+
     for i in items:
         qty = i.get("quantity", 1) or 1
         price = (i.get("purchase_price") or i.get("sale_price") or 0) * qty
@@ -71,24 +92,10 @@ def get_collection_stats(
 
         # resolver variante para taxonomía
         vid = i.get("item_variant_id")
-        variant = None
-        if vid:
-            try:
-                from app.db import as_id
-
-                variant = db.variants.find_one({"_id": as_id(str(vid))})
-            except Exception:  # noqa: BLE001
-                variant = db.variants.find_one({"_id": str(vid)})
+        variant = variants_by_id.get(str(vid)) if vid else None
         meta = (variant or {}).get("metadata") or {}
-        master = {}
         mid = (variant or {}).get("item_master_id")
-        if mid:
-            try:
-                from app.db import as_id
-
-                master = db.items.find_one({"_id": as_id(str(mid))}) or {}
-            except Exception:  # noqa: BLE001
-                master = db.items.find_one({"_id": str(mid)}) or {}
+        master = masters_by_id.get(str(mid), {}) if mid else {}
 
         rarity = (variant or {}).get("rarity") or "regular"
         by_rarity[rarity] = by_rarity.get(rarity, 0) + qty
@@ -127,10 +134,11 @@ def get_collection_stats(
     unique_variants = len(set(variant_ids))
     duplicates = total_items - unique_variants
 
-    wishlist = db.lists.find_one({"user_id": user.id, "list_type": "wishlist"})
+    # Colecciones reales del router de listas (antes `lists`/`list_items`: siempre 0).
+    wishlist = db.user_lists.find_one({"user_id": user.id, "list_type": "wishlist"})
     wishlist_count = 0
     if wishlist:
-        wishlist_count = db.list_items.count_documents({"list_id": str(wishlist["_id"])})
+        wishlist_count = db.user_list_items.count_documents({"user_list_id": str(wishlist["_id"])})
 
     tradeable_count = sum(1 for i in items if i.get("is_tradeable"))
     for_sale_count = sum(1 for i in items if i.get("is_for_sale"))
@@ -142,6 +150,9 @@ def get_collection_stats(
     recent_adds = 0
     for i in items:
         ca = i.get("created_at")
+        # PyMongo devuelve fechas SIN zona: compararlas con una con zona daba 500.
+        if isinstance(ca, datetime) and ca.tzinfo is None:
+            ca = ca.replace(tzinfo=timezone.utc)
         if isinstance(ca, datetime) and ca >= since:
             recent_adds += i.get("quantity", 1) or 1
 

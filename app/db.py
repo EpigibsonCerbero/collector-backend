@@ -172,6 +172,21 @@ INDEXES: dict[str, list[tuple[list[tuple[str, int]], dict[str, Any]]]] = {
     ],
     "chat_messages": [
         ([("thread_id", ASCENDING), ("timestamp", ASCENDING)], {}),
+        ([("thread_id", ASCENDING), ("author_id", ASCENDING), ("client_id", ASCENDING)], {}),
+    ],
+    # Fallos de login/códigos: caducan solos a la hora (TTL).
+    "auth_failures": [
+        ([("at", ASCENDING)], {"expireAfterSeconds": 3600}),
+        ([("key", ASCENDING), ("at", ASCENDING)], {}),
+    ],
+    "chat_reads": [
+        ([("thread_id", ASCENDING), ("user_id", ASCENDING)], {"unique": True}),
+    ],
+    "challenge_claims": [
+        ([("user_id", ASCENDING), ("challenge_id", ASCENDING)], {"unique": True}),
+    ],
+    "alerts": [
+        ([("user_id", ASCENDING), ("created_at", DESCENDING)], {}),
     ],
     "user_favorites": [
         ([("user_id", ASCENDING), ("kind", ASCENDING), ("event_id", ASCENDING)], {"unique": True}),
@@ -183,4 +198,8 @@ def ensure_indexes() -> None:
     db = get_db()
     for coll, defs in INDEXES.items():
         for keys, opts in defs:
-            db[coll].create_index(keys, **opts)
+            # Uno a uno: un índice en conflicto no debe impedir el arranque ni el seed.
+            try:
+                db[coll].create_index(keys, **opts)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[indexes] {coll} {keys}: {exc}")

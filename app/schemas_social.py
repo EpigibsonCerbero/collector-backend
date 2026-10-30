@@ -191,7 +191,9 @@ class FriendOut(BaseModel):
 
 
 class FriendAdd(BaseModel):
-    friend_id: str
+    # Se resuelve contra los usuarios reales: `username` (sin @, sin mayúsculas
+    # exactas) o, si no, `friend_id` como usuario o id.
+    friend_id: str = ""
     username: str = ""
     avatar: str = ""
     location: str = ""
@@ -201,6 +203,7 @@ class FriendAdd(BaseModel):
 class ShowcaseItemOut(BaseModel):
     id: str
     friend_id: str
+    variant_id: str = ""
     variant_name: str
     livery: str = ""
     box_number: str = ""
@@ -253,26 +256,49 @@ class EventOut(BaseModel):
 class ChatMessageCreate(BaseModel):
     sender: Literal["partner", "user", "system"] = "user"
     author_name: Optional[str] = None
-    text: Optional[str] = None
-    type: Literal["text", "photo_verification", "escrow_alert"] = "text"
+    text: Optional[str] = Field(default=None, max_length=4000)
+    type: Literal["text", "image", "gif", "voice", "piece", "photo_verification", "escrow_alert"] = "text"
     photo_url: Optional[str] = None
+    voice_url: Optional[str] = None
+    voice_duration: Optional[float] = None
+    piece_id: Optional[str] = None
+    piece_name: Optional[str] = Field(default=None, max_length=200)
+    piece_image: Optional[str] = None
+    piece_meta: Optional[str] = Field(default=None, max_length=120)
     seal_code: Optional[str] = None
     condition: Optional[str] = None
     amount: Optional[str] = None
+    reply_to_id: Optional[str] = None
+    reply_to_text: Optional[str] = Field(default=None, max_length=280)
+    # Id que genera el cliente para casar su burbuja «enviando…» con el eco del servidor.
+    client_id: Optional[str] = Field(default=None, max_length=64)
 
 
 class ChatMessageOut(BaseModel):
     id: str
     thread_id: str
     sender: str
+    author_id: Optional[str] = None
     author_name: Optional[str] = None
     timestamp: str
     text: Optional[str] = None
     type: str = "text"
     photo_url: Optional[str] = None
+    voice_url: Optional[str] = None
+    voice_duration: Optional[float] = None
+    piece_id: Optional[str] = None
+    piece_name: Optional[str] = None
+    piece_image: Optional[str] = None
+    piece_meta: Optional[str] = None
     seal_code: Optional[str] = None
     condition: Optional[str] = None
     amount: Optional[str] = None
+    reply_to_id: Optional[str] = None
+    reply_to_text: Optional[str] = None
+    # Una reacción por usuario ({user_id: emoji}); `reactions` = sus emojis, para pintar.
+    reactions: list[str] = Field(default_factory=list)
+    reactions_by: dict[str, str] = Field(default_factory=dict)
+    client_id: Optional[str] = None
 
 
 class Page(BaseModel):

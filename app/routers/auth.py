@@ -1,13 +1,17 @@
 """Auth: registro, login, refresh, perfil y restablecimiento de contraseña."""
 from __future__ import annotations
 
+import re
+
 import secrets
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pymongo import ReturnDocument
 
 from app.db import get_db, oid, serialize
+from app.ratelimit import client_ip, fail_check, fail_clear, fail_record, hit_or_429
+from app.services.mailer import mail_enabled, send_mail
 from app.schemas import (
     ChangePasswordRequest,
     ForgotPasswordRequest,
@@ -50,9 +54,10 @@ def _user_out(doc: dict) -> UserProfileOut:
 def _tokens(user_doc: dict) -> TokenResponse:
     uid = str(user_doc["_id"])
     username = user_doc["username"]
+    tv = int(user_doc.get("token_version", 0))
     return TokenResponse(
-        access_token=create_access_token(uid, username),
-        refresh_token=create_refresh_token(uid, username),
+        access_token=create_access_token(uid, username, tv),
+        refresh_token=create_refresh_token(uid, username, tv),
         user=_user_out(user_doc),
     )
 
@@ -94,14 +99,23 @@ def register(body: RegisterRequest) -> TokenResponse:
 
 
 @router.post("/login")
-def login(body: dict):
+def login(body: dict, request: Request):
     db = get_db()
-    email = body.get("email", "").lower()
-    password = body.get("password", "")
-    totp_code = body.get("totp_code", "")
+    identifier = str(body.get("email", "")).lower().strip()
+    password = str(body.get("password", ""))
+    totp_code = str(body.get("totp_code", "") or "")
+    ip = client_ip(request)
+    key = f"login:{identifier}"
+    fail_check(db, key, ip)
 
-    user = db.users.find_one({"email": email})
+    # Acepta email O username: si trae @, busca por email; si no, por username
+    if "@" in identifier:
+        user = db.users.find_one({"email": identifier})
+    else:
+        user = db.users.find_one({"username": {"$regex": f"^{re.escape(identifier)}$", "$options": "i"}})
+
     if not user or not verify_password(password, user["pwd_hash"]):
+        fail_record(db, key, ip)
         raise HTTPException(status_code=401, detail="Credenciales inválidas")
     if not user.get("is_active", True):
         raise HTTPException(status_code=403, detail="Cuenta desactivada")
@@ -119,8 +133,10 @@ def login(body: dict):
             raise HTTPException(status_code=500, detail="Error de configuración 2FA")
         totp = pyotp.TOTP(secret)
         if not totp.verify(totp_code, valid_window=1):
+            fail_record(db, key, ip)
             raise HTTPException(status_code=401, detail="Código 2FA inválido")
 
+    fail_clear(db, key)
     return _tokens(user)
 
 
@@ -131,6 +147,8 @@ def refresh(body: RefreshRequest) -> TokenResponse:
     user = db.users.find_one({"_id": oid(payload["sub"])})
     if not user or not user.get("is_active", True):
         raise HTTPException(status_code=401, detail="Usuario no válido")
+    if int(payload.get("tv", 0)) != int(user.get("token_version", 0)):
+        raise HTTPException(status_code=401, detail="Sesión cerrada. Inicia sesión de nuevo.")
     return _tokens(user)
 
 
@@ -168,34 +186,43 @@ def update_me(
 RESET_TTL_MIN = 30
 
 
-@router.post("/change-password", status_code=status.HTTP_204_NO_CONTENT)
+@router.post("/change-password", response_model=TokenResponse)
 def change_password(
     body: ChangePasswordRequest,
     user: CurrentUser = Depends(get_current_user),
-) -> None:
+) -> TokenResponse:
     db = get_db()
     doc = db.users.find_one({"_id": oid(user.id)})
     if not doc:
         raise HTTPException(status_code=404, detail="Usuario no encontrado")
     if not verify_password(body.current_password, doc["pwd_hash"]):
         raise HTTPException(status_code=401, detail="La contraseña actual es incorrecta")
-    db.users.update_one(
+    # Sube la versión de token: el resto de sesiones se cierran; esta recibe tokens nuevos.
+    doc = db.users.find_one_and_update(
         {"_id": oid(user.id)},
-        {"$set": {"pwd_hash": hash_password(body.new_password), "updated_at": _now()}},
+        {
+            "$set": {"pwd_hash": hash_password(body.new_password), "updated_at": _now()},
+            "$inc": {"token_version": 1},
+        },
+        return_document=ReturnDocument.AFTER,
     )
+    return _tokens(doc)
 
 
 @router.post("/forgot-password", response_model=ForgotPasswordResponse)
-def forgot_password(body: ForgotPasswordRequest) -> ForgotPasswordResponse:
-    """Genera un código de restablecimiento.
+def forgot_password(body: ForgotPasswordRequest, request: Request) -> ForgotPasswordResponse:
+    """Envía por correo un código de restablecimiento.
 
-    Self-hosted: sin SMTP el código se devuelve en la respuesta en vez de por email.
-    Si no existe la cuenta responde igual (no filtra usuarios registrados).
+    Nunca devuelve el código. Sin SMTP responde `unavailable`. Si la cuenta no
+    existe responde igual (no filtra usuarios registrados).
     """
+    hit_or_429("forgot", client_ip(request), limit=5, per_seconds=900)
+    if not mail_enabled():
+        return ForgotPasswordResponse(delivery="unavailable")
     db = get_db()
     user = db.users.find_one({"email": body.email.lower()})
     if not user or not user.get("is_active", True):
-        return ForgotPasswordResponse(reset_code=None)
+        return ForgotPasswordResponse()
 
     code = f"{secrets.randbelow(1_000_000):06d}"
     db.users.update_one(
@@ -211,12 +238,19 @@ def forgot_password(body: ForgotPasswordRequest) -> ForgotPasswordResponse:
             }
         },
     )
-    return ForgotPasswordResponse(reset_code=code, expires_in_min=RESET_TTL_MIN)
+    send_mail(
+        user["email"],
+        "Tu código para restablecer la contraseña de CURIO",
+        f"Tu código es: {code}\n\nCaduca en {RESET_TTL_MIN} minutos. Si no lo pediste, ignora este correo.",
+    )
+    return ForgotPasswordResponse(expires_in_min=RESET_TTL_MIN)
 
 
 @router.post("/reset-password", status_code=status.HTTP_204_NO_CONTENT)
-def reset_password(body: ResetPasswordRequest) -> None:
+def reset_password(body: ResetPasswordRequest, request: Request) -> None:
     db = get_db()
+    key, ip = f"reset:{body.email.lower()}", client_ip(request)
+    fail_check(db, key, ip)
     user = db.users.find_one({"email": body.email.lower()})
     if not user:
         raise HTTPException(status_code=400, detail="Código inválido o expirado")
@@ -230,6 +264,7 @@ def reset_password(body: ResetPasswordRequest) -> None:
         raise HTTPException(status_code=429, detail="Demasiados intentos. Solicita un código nuevo.")
     if not verify_password(body.code, reset.get("code_hash", "")):
         db.users.update_one({"_id": user["_id"]}, {"$inc": {"pwd_reset.attempts": 1}})
+        fail_record(db, key, ip)
         raise HTTPException(status_code=400, detail="Código inválido o expirado")
 
     db.users.update_one(
@@ -237,24 +272,29 @@ def reset_password(body: ResetPasswordRequest) -> None:
         {
             "$set": {"pwd_hash": hash_password(body.new_password), "updated_at": _now()},
             "$unset": {"pwd_reset": ""},
+            "$inc": {"token_version": 1},
         },
     )
+    fail_clear(db, key)
 
 
 MAGIC_TTL_MIN = 10
 
 
 @router.post("/magic-code", response_model=MagicCodeResponse)
-def magic_code(body: MagicCodeRequest) -> MagicCodeResponse:
-    """Genera un código de acceso de un solo uso (equivalente al magic link).
+def magic_code(body: MagicCodeRequest, request: Request) -> MagicCodeResponse:
+    """Envía por correo un código de acceso de un solo uso (equivale al magic link).
 
-    Self-hosted: sin SMTP el código se devuelve en la respuesta en vez de por email.
-    Si la cuenta no existe responde igual (no filtra usuarios registrados).
+    Nunca devuelve el código. Sin SMTP responde `unavailable`. Si la cuenta no
+    existe responde igual (no filtra usuarios registrados).
     """
+    hit_or_429("magic", client_ip(request), limit=5, per_seconds=900)
+    if not mail_enabled():
+        return MagicCodeResponse(delivery="unavailable")
     db = get_db()
     user = db.users.find_one({"email": body.email.lower()})
     if not user or not user.get("is_active", True):
-        return MagicCodeResponse(code=None)
+        return MagicCodeResponse()
 
     code = f"{secrets.randbelow(1_000_000):06d}"
     db.users.update_one(
@@ -270,12 +310,19 @@ def magic_code(body: MagicCodeRequest) -> MagicCodeResponse:
             }
         },
     )
-    return MagicCodeResponse(code=code, expires_in_min=MAGIC_TTL_MIN)
+    send_mail(
+        user["email"],
+        "Tu código de acceso a CURIO",
+        f"Tu código es: {code}\n\nCaduca en {MAGIC_TTL_MIN} minutos. Si no lo pediste, ignora este correo.",
+    )
+    return MagicCodeResponse(expires_in_min=MAGIC_TTL_MIN)
 
 
 @router.post("/magic-login", response_model=TokenResponse)
-def magic_login(body: MagicLoginRequest) -> TokenResponse:
+def magic_login(body: MagicLoginRequest, request: Request) -> TokenResponse:
     db = get_db()
+    key, ip = f"magic:{body.email.lower()}", client_ip(request)
+    fail_check(db, key, ip)
     user = db.users.find_one({"email": body.email.lower()})
     if not user or not user.get("is_active", True):
         raise HTTPException(status_code=400, detail="Código inválido o expirado")
@@ -290,9 +337,21 @@ def magic_login(body: MagicLoginRequest) -> TokenResponse:
         raise HTTPException(status_code=429, detail="Demasiados intentos. Solicita un código nuevo.")
     if not verify_password(body.code, saved.get("code_hash", "")):
         db.users.update_one({"_id": user["_id"]}, {"$inc": {"magic_code.attempts": 1}})
+        fail_record(db, key, ip)
         raise HTTPException(status_code=400, detail="Código inválido o expirado")
 
+    # El código por correo NO se salta el 2FA.
+    if user.get("totp_enabled"):
+        import pyotp
+
+        if not body.totp_code or not user.get("totp_secret") or not pyotp.TOTP(user["totp_secret"]).verify(
+            body.totp_code, valid_window=1
+        ):
+            fail_record(db, key, ip)
+            raise HTTPException(status_code=401, detail="Se requiere el código de verificación 2FA")
+
     db.users.update_one({"_id": user["_id"]}, {"$unset": {"magic_code": ""}})
+    fail_clear(db, key)
     user.pop("magic_code", None)
     return _tokens(user)
 

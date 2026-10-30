@@ -41,12 +41,36 @@ class Base64Upload(BaseModel):
     prefix: str = "img"
 
 
+_FORMAT_EXT = {"JPEG": ".jpg", "PNG": ".png", "WEBP": ".webp", "GIF": ".gif"}
+
+
+def _real_image_ext(data: bytes) -> str:
+    """Valida que los bytes SEAN una imagen (no basta la extensión del nombre:
+    se podía alojar cualquier archivo con nombre .jpg). Devuelve la extensión real."""
+    import io
+
+    try:
+        from PIL import Image
+
+        with Image.open(io.BytesIO(data)) as im:
+            fmt = (im.format or "").upper()
+            im.verify()
+    except Exception:
+        raise HTTPException(status_code=400, detail="El archivo no es una imagen válida")
+    ext = _FORMAT_EXT.get(fmt)
+    if not ext:
+        raise HTTPException(status_code=400, detail="Formato no permitido (JPG, PNG, WEBP o GIF)")
+    return ext
+
+
 def _save_bytes(data: bytes, ext: str, prefix: str) -> tuple[str, int]:
     """Guarda bytes en disco y retorna (filename, size)."""
     if len(data) > MAX_FILE_SIZE:
         raise HTTPException(status_code=413, detail="Imagen muy grande (máx 10MB)")
     if len(data) < 100:
         raise HTTPException(status_code=400, detail="Imagen inválida o vacía")
+    ext = _real_image_ext(data)
+    prefix = "".join(ch for ch in prefix if ch.isalnum())[:16] or "img"
 
     # Nombre único basado en hash + timestamp
     content_hash = hashlib.md5(data).hexdigest()[:12]
@@ -78,7 +102,7 @@ async def upload_image(
     filename, size = _save_bytes(data, ext, "upload")
 
     return UploadResponse(
-        url=f"/uploads/{filename}",
+        url=f"/api/v1/uploads/{filename}",
         filename=filename,
         size=size,
     )
@@ -91,7 +115,10 @@ async def upload_image_base64(
 ) -> UploadResponse:
     """Sube una imagen en base64 (para capturas de cámara)."""
     try:
-        data = base64.b64decode(body.image_base64)
+        raw = body.image_base64
+        if raw.startswith("data:") and "," in raw:
+            raw = raw.split(",", 1)[1]
+        data = base64.b64decode(raw, validate=False)
     except Exception:
         raise HTTPException(status_code=400, detail="base64 inválido")
 
@@ -107,22 +134,65 @@ async def upload_image_base64(
 
     filename, size = _save_bytes(data, ext, body.prefix)
 
+    # Ruta servible tal cual (antes `/uploads/…` daba 404: la ruta real lleva /api/v1).
     return UploadResponse(
-        url=f"/uploads/{filename}",
+        url=f"/api/v1/uploads/{filename}",
         filename=filename,
         size=size,
     )
 
 
+@router.post("/voice-base64", response_model=UploadResponse, status_code=201)
+async def upload_voice_base64(
+    body: Base64Upload,
+    user: CurrentUser = Depends(get_current_user),
+) -> UploadResponse:
+    """Sube una nota de voz (m4a/aac/mp3/wav) en base64."""
+    try:
+        raw = body.image_base64
+        if raw.startswith("data:") and "," in raw:
+            raw = raw.split(",", 1)[1]
+        data = base64.b64decode(raw, validate=False)
+    except Exception:
+        raise HTTPException(status_code=400, detail="base64 inválido")
+
+    mime_ext = {
+        "audio/m4a": ".m4a",
+        "audio/mp4": ".m4a",
+        "audio/aac": ".aac",
+        "audio/mpeg": ".mp3",
+        "audio/mp3": ".mp3",
+        "audio/wav": ".wav",
+        "audio/x-wav": ".wav",
+    }
+    ext = mime_ext.get(body.mime, ".m4a")
+    if len(data) > MAX_FILE_SIZE:
+        raise HTTPException(status_code=413, detail="Audio muy grande (máx 10MB)")
+    if len(data) < 50:
+        raise HTTPException(status_code=400, detail="Audio inválido o vacío")
+
+    prefix = "".join(ch for ch in (body.prefix or "voice") if ch.isalnum())[:16] or "voice"
+    content_hash = hashlib.md5(data).hexdigest()[:12]
+    timestamp = int(time.time() * 1000)
+    filename = f"{prefix}_{timestamp}_{content_hash}{ext}"
+    filepath = UPLOAD_DIR / filename
+    filepath.write_bytes(data)
+    return UploadResponse(
+        url=f"/api/v1/uploads/{filename}",
+        filename=filename,
+        size=len(data),
+    )
+
+
 @router.get("/{filename}")
 async def get_image(filename: str) -> FileResponse:
-    """Sirve una imagen subida."""
+    """Sirve una imagen o audio subido."""
     filepath = UPLOAD_DIR / filename
-    if not filepath.exists() or not filepath.is_file():
-        raise HTTPException(status_code=404, detail="Imagen no encontrada")
-
-    # Prevenir path traversal
+    # Path traversal ANTES de tocar el disco.
     if not filepath.resolve().is_relative_to(UPLOAD_DIR.resolve()):
         raise HTTPException(status_code=403, detail="Acceso denegado")
+    if not filepath.exists() or not filepath.is_file():
+        raise HTTPException(status_code=404, detail="Archivo no encontrado")
 
-    return FileResponse(filepath)
+    # Inmutables (nombre con hash): el teléfono puede cachearlas para siempre.
+    return FileResponse(filepath, headers={"Cache-Control": "public, max-age=31536000, immutable"})

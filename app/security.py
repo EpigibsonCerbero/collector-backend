@@ -45,21 +45,25 @@ def create_token(sub: str, token_type: str, ttl: timedelta, **extra: object) -> 
     return jwt.encode(payload, settings.jwt_secret, algorithm=settings.jwt_alg)
 
 
-def create_access_token(sub: str, username: str) -> str:
+def create_access_token(sub: str, username: str, tv: int = 0) -> str:
     return create_token(
         sub,
         "access",
         timedelta(minutes=get_settings().access_ttl_min),
         username=username,
+        tv=tv,
     )
 
 
-def create_refresh_token(sub: str, username: str) -> str:
+def create_refresh_token(sub: str, username: str, tv: int = 0) -> str:
+    # `tv` (token_version): al cambiar/restablecer la contraseña sube y todos
+    # los refresh anteriores dejan de valer (cierra sesiones robadas).
     return create_token(
         sub,
         "refresh",
         timedelta(days=get_settings().refresh_ttl_days),
         username=username,
+        tv=tv,
     )
 
 
@@ -86,6 +90,17 @@ class CurrentUser(dict):
     @property
     def username(self) -> str:
         return self["username"]
+
+
+def require_admin(
+    creds: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer)],
+) -> "CurrentUser":
+    """Solo ids listados en ADMIN_USER_IDS (editar el catálogo global, etc.)."""
+    user = get_current_user(creds)
+    admins = {x.strip() for x in get_settings().admin_user_ids.split(",") if x.strip()}
+    if user.id not in admins:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Solo administradores")
+    return user
 
 
 def get_current_user(

@@ -46,3 +46,24 @@ def mark_alert_read(
         {"$set": {"read": True}},
     )
     return {"ok": True}
+
+
+def notify(db, user_id: str, type: str, title: str, message: str, icon: str = "🔔") -> None:
+    """Crea una alerta para `user_id`. Best-effort: nunca rompe la petición que la origina."""
+    try:
+        db.alerts.insert_one(
+            {
+                "user_id": user_id,
+                "type": type,
+                "title": title,
+                "message": message,
+                "icon": icon,
+                "read": False,
+                "created_at": _now(),
+            }
+        )
+    except Exception:
+        return
+    from app.routers.notifications import send_push
+
+    send_push(db, user_id, title, message, {"type": type})

@@ -1,10 +1,12 @@
 """Catálogo: marcas, series, categorías, items_master + variantes."""
 from __future__ import annotations
 
+import re
+
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile
 from pymongo import DESCENDING, ReturnDocument
 
 from app.db import as_id, get_db, oid, serialize, serialize_many
@@ -24,7 +26,7 @@ from app.schemas import (
     SpecFieldStatus,
     UpcExtractOut,
 )
-from app.security import CurrentUser, get_current_user
+from app.security import CurrentUser, get_current_user, require_admin
 
 router = APIRouter(tags=["catalog"])
 
@@ -71,7 +73,7 @@ def list_brands() -> list[BrandOut]:
 @router.post("/brands", response_model=BrandOut, status_code=201)
 def create_brand(
     body: BrandCreate,
-    user: CurrentUser = Depends(get_current_user),
+    user: CurrentUser = Depends(require_admin),
 ) -> BrandOut:
     db = get_db()
     if db.brands.find_one({"slug": body.slug}):
@@ -104,7 +106,7 @@ def list_series(brand_id: Optional[str] = None) -> list[SeriesOut]:
 @router.post("/series", response_model=SeriesOut, status_code=201)
 def create_series(
     body: SeriesCreate,
-    user: CurrentUser = Depends(get_current_user),
+    user: CurrentUser = Depends(require_admin),
 ) -> SeriesOut:
     db = get_db()
     if not db.brands.find_one({"_id": oid(body.brand_id)}):
@@ -169,7 +171,7 @@ def list_categories() -> list[CategoryOut]:
 @router.post("/categories", response_model=CategoryOut, status_code=201)
 def create_category(
     body: CategoryCreate,
-    user: CurrentUser = Depends(get_current_user),
+    user: CurrentUser = Depends(require_admin),
 ) -> CategoryOut:
     db = get_db()
     if db.categories.find_one({"slug": body.slug}):
@@ -186,31 +188,277 @@ def create_category(
 
 @router.get("/catalog/variants", response_model=list[ItemVariantOut])
 def list_variants(
+    response: Response,
     limit: int = Query(default=100, ge=1, le=1000),
     offset: int = Query(default=0, ge=0),
     brand: Optional[str] = None,
     rarity: Optional[str] = None,
     search: Optional[str] = None,
+    manufacturer: Optional[str] = None,
+    sub_brand: Optional[str] = None,
+    scale: Optional[str] = None,
+    color: Optional[str] = None,
+    decade: Optional[str] = None,
+    sort: str = Query(default="name", pattern="^(name|year|code|recent)$"),
+    sort_dir: str = Query(default="asc", pattern="^(asc|desc)$"),
 ) -> list[ItemVariantOut]:
+    """Listado paginado de variantes con filtros y orden.
+
+    Usa aggregation + $lookup para traer el master en la misma query (antes
+    era N+1: un find_one por variante). Devuelve el total en la cabecera
+    `X-Total-Count` para que la UI sepa cuándo parar de paginar.
+    """
     db = get_db()
-    query: dict = {}
+    match: dict = {}
     if rarity:
-        query["rarity"] = rarity
+        match["rarity"] = rarity
+    and_clauses: list[dict] = []
     if search:
-        query["$or"] = [
-            {"variant_name": {"$regex": search, "$options": "i"}},
-            {"toy_number": {"$regex": search, "$options": "i"}},
-            {"name": {"$regex": search, "$options": "i"}},
+        # Antes: la frase entera como regex SIN escapar (ReDoS) y solo sobre
+        # campos de la variante — el nombre del modelo vive en el maestro
+        # (`items`), así que «Skyline R34» casi nunca encontraba nada.
+        # Ahora: cada palabra debe aparecer en modelo/marca/livery/toy#/UPC.
+        for tok in [t for t in re.split(r"\s+", search.strip()) if t][:6]:
+            rx = {"$regex": re.escape(tok), "$options": "i"}
+            mids = [
+                str(d["_id"])
+                for d in db.items.find(
+                    {"$or": [{"name": rx}, {"manufacturer": rx}, {"casting_name": rx}]}, {"_id": 1}
+                ).limit(5000)
+            ]
+            and_clauses.append(
+                {
+                    "$or": [
+                        {"variant_name": rx},
+                        {"toy_number": rx},
+                        {"sku_upc": rx},
+                        {"livery_desc": rx},
+                        {"item_master_id": {"$in": mids}},
+                    ]
+                }
+            )
+    if scale:
+        # el seed guarda "1/64" (con barra); aceptar ambos formatos.
+        # En $and: antes se mezclaba en el mismo $or que la búsqueda (unión, no intersección).
+        sx = scale.replace(":", "/")
+        and_clauses.append({"$or": [{"metadata.scale": sx}, {"metadata.scale": scale}]})
+    if and_clauses:
+        match["$and"] = and_clauses
+    if color:
+        # Grey/Gray se unifican en la UI
+        if color == "Grey":
+            match["body_color"] = {"$in": ["Grey", "Gray"]}
+        else:
+            match["body_color"] = color
+
+    # manufacturer / sub_brand / brand viven en el master → filtrar por ids
+    master_cond: dict = {}
+    if manufacturer:
+        master_cond["manufacturer"] = manufacturer
+    if sub_brand:
+        master_cond["$or"] = [
+            {"sub_brand": sub_brand},
+            {"metadata.sub_brand": sub_brand},
         ]
     if brand:
-        master_ids = [d["_id"] for d in db.items.find({"brand_id": brand}, {"_id": 1})]
-        query["item_master_id"] = {"$in": [str(m) for m in master_ids]}
+        master_cond["brand_id"] = brand
 
-    docs = list(db.variants.find(query).sort("created_at", -1).skip(offset).limit(limit))
+    if master_cond:
+        master_ids = [str(d["_id"]) for d in db.items.find(master_cond, {"_id": 1})]
+        if not master_ids:
+            response.headers["X-Total-Count"] = "0"
+            return []
+        match["item_master_id"] = {"$in": master_ids}
+
+    # Antes: $lookup de TODAS las variantes con su maestro, dos veces (contar y
+    # ordenar) → 1.4 s el listado sin filtros. Ahora: se traen solo los campos
+    # mínimos, se filtra/ordena en memoria con el caché de maestros y solo se
+    # cargan completas las piezas de la página.
+    mcache = _master_cache(db)
+    rows = list(
+        db.variants.find(match, {"_id": 1, "item_master_id": 1, "variant_name": 1, "toy_number": 1, "created_at": 1})
+    )
+    if decade:
+        try:
+            dec = int(float(decade))  # acepta «2020.0» de versiones viejas de la app
+            rows = [r for r in rows if dec <= (mcache.get(str(r.get("item_master_id")), ("", None))[1] or -1) < dec + 10]
+        except ValueError:
+            pass
+    response.headers["X-Total-Count"] = str(len(rows))
+
+    desc = sort_dir == "desc"
+
+    def _mname(r: dict) -> str:
+        return (mcache.get(str(r.get("item_master_id")), ("", None))[0] or r.get("variant_name") or "").lower()
+
+    if sort == "year":
+        # Sin año siempre al final, en ambos sentidos.
+        with_year = [r for r in rows if mcache.get(str(r.get("item_master_id")), ("", None))[1]]
+        without = [r for r in rows if not mcache.get(str(r.get("item_master_id")), ("", None))[1]]
+        with_year.sort(key=lambda r: mcache[str(r.get("item_master_id"))][1], reverse=desc)
+        rows = with_year + without
+    elif sort == "code":
+        rows.sort(key=lambda r: (r.get("toy_number") is None, r.get("toy_number") or ""), reverse=desc)
+    elif sort == "recent":
+        rows.sort(key=lambda r: str(r.get("created_at") or ""), reverse=desc)
+    else:
+        rows.sort(key=lambda r: (_mname(r), (r.get("variant_name") or "").lower()), reverse=desc)
+
+    page = rows[offset : offset + limit]
+    if not page:
+        return []
+    full = {str(d["_id"]): d for d in db.variants.find({"_id": {"$in": [r["_id"] for r in page]}})}
+    mkeys = []
+    for r in page:
+        mid = r.get("item_master_id")
+        if mid:
+            try:
+                mkeys.append(as_id(str(mid)))
+            except Exception:  # noqa: BLE001
+                mkeys.append(str(mid))
+    masters = {str(m["_id"]): m for m in db.items.find({"_id": {"$in": mkeys}})} if mkeys else {}
     out: list[ItemVariantOut] = []
-    for d in docs:
-        out.append(_variant_out(d, _load_master(db, d)))
+    for r in page:
+        d = full.get(str(r["_id"]))
+        if d:
+            out.append(_variant_out(d, masters.get(str(d.get("item_master_id")))))
     return out
+
+
+_MASTER_CACHE: dict = {"at": 0.0, "data": {}}
+
+
+def _master_cache(db) -> dict[str, tuple[str, int | None]]:
+    """{id maestro: (nombre, año)} en memoria, 5 min. ~9k entradas, pocos KB."""
+    import time
+
+    now = time.monotonic()
+    if now - _MASTER_CACHE["at"] > 300 or not _MASTER_CACHE["data"]:
+        _MASTER_CACHE["data"] = {
+            str(m["_id"]): (m.get("name") or "", m.get("release_year"))
+            for m in db.items.find({}, {"name": 1, "release_year": 1})
+        }
+        _MASTER_CACHE["at"] = now
+    return _MASTER_CACHE["data"]
+
+
+@router.get("/catalog/variants/count")
+def count_variants() -> dict:
+    """Total de variantes (para la UI sin tener que paginar)."""
+    return {"total": get_db().variants.count_documents({})}
+
+
+@router.get("/catalog/facets")
+def catalog_facets() -> dict:
+    """Facetas para los chips de filtro del catálogo.
+
+    Cuenta en Mongo (aggregation) en vez de bajar las 9k variantes al cliente
+    para armar los contadores en JS. Devuelve solo valores con >=1 pieza.
+    """
+    db = get_db()
+
+    def _agg(pipeline: list[dict]) -> list[dict]:
+        return list(db.variants.aggregate(pipeline))
+
+    # manufacturer vive en items (master) → contar por master
+    brands_raw = list(
+        db.items.aggregate(
+            [
+                {"$match": {"manufacturer": {"$exists": True, "$ne": ""}}},
+                {"$group": {"_id": "$manufacturer", "count": {"$sum": 1}}},
+                {"$sort": {"count": -1}},
+            ]
+        )
+    )
+
+    # sub_brand: en metadata.sub_brand de la variante o sub_brand del master
+    sb_var = _agg(
+        [
+            {"$match": {"metadata.sub_brand": {"$exists": True, "$ne": ""}}},
+            {"$group": {"_id": "$metadata.sub_brand", "count": {"$sum": 1}}},
+        ]
+    )
+    sb_master = list(
+        db.items.aggregate(
+            [
+                {"$match": {"sub_brand": {"$exists": True, "$ne": ""}}},
+                {"$group": {"_id": "$sub_brand", "count": {"$sum": 1}}},
+            ]
+        )
+    )
+    sb_counts: dict[str, int] = {}
+    for r in sb_var + sb_master:
+        key = str(r["_id"])
+        sb_counts[key] = sb_counts.get(key, 0) + r["count"]
+
+    scales_raw = _agg(
+        [
+            {"$match": {"metadata.scale": {"$exists": True, "$ne": ""}}},
+            {"$group": {"_id": "$metadata.scale", "count": {"$sum": 1}}},
+        ]
+    )
+    colors_raw = _agg(
+        [
+            {"$match": {"body_color": {"$exists": True, "$ne": ""}}},
+            {"$group": {"_id": "$body_color", "count": {"$sum": 1}}},
+        ]
+    )
+    rarities_raw = _agg([{"$group": {"_id": "$rarity", "count": {"$sum": 1}}}])
+
+    # décadas desde release_year del master
+    decades_raw = list(
+        db.items.aggregate(
+            [
+                {"$match": {"release_year": {"$gt": 0}}},
+                {
+                    "$group": {
+                        "_id": {
+                            "$subtract": [
+                                "$release_year",
+                                {"$mod": ["$release_year", 10]},
+                            ]
+                        },
+                        "count": {"$sum": 1},
+                    }
+                },
+                {"$sort": {"_id": -1}},
+            ]
+        )
+    )
+
+    def _pack(raw: list[dict]) -> list[dict]:
+        return [
+            {"value": str(r["_id"]), "count": r["count"]}
+            for r in raw
+            if r.get("_id") not in (None, "")
+        ]
+
+    # normaliza Grey/Gray en un solo chip
+    color_merged: dict[str, int] = {}
+    for r in colors_raw:
+        key = "Grey" if str(r["_id"]) == "Gray" else str(r["_id"])
+        color_merged[key] = color_merged.get(key, 0) + r["count"]
+    colors_out = sorted(
+        ({"value": k, "count": v} for k, v in color_merged.items() if k),
+        key=lambda x: -x["count"],
+    )
+
+    return {
+        "brands": _pack(brands_raw),
+        "sub_brands": sorted(
+            ({"value": k, "count": v} for k, v in sb_counts.items() if k),
+            key=lambda x: -x["count"],
+        ),
+        "scales": sorted(_pack(scales_raw), key=lambda x: x["value"]),
+        "colors": colors_out,
+        # Entero: algunos release_year son float (2024.0) y salía «2020.0s».
+        "decades": [
+            {"value": str(int(r["_id"])), "count": r["count"]}
+            for r in decades_raw
+            if r.get("_id") is not None
+        ],
+        "rarities": _pack(rarities_raw),
+    }
 
 
 @router.get("/catalog/variants/by-hash/{ai_hash}", response_model=ItemVariantOut)
@@ -293,6 +541,9 @@ def create_catalog_item(
     variant_doc["item_master_id"] = master_id
     variant_doc["ai_local_hash"] = ai_hash or f"hash-{(data.get('toy_number') or variant_id or master_id).lower()}"
     variant_doc["created_at"] = now
+    # Alta hecha por un usuario (no por el scrape): se marca para poder moderarla.
+    variant_doc["created_by"] = user.id
+    variant_doc["user_submitted"] = True
     if variant_id:
         variant_doc["_id"] = oid(variant_id) if _is_oid(variant_id) else variant_id
 
@@ -324,7 +575,7 @@ def _is_oid(value: str) -> bool:
 def update_variant(
     variant_id: str,
     body: dict,
-    user: CurrentUser = Depends(get_current_user),
+    user: CurrentUser = Depends(require_admin),
 ) -> ItemVariantOut:
     db = get_db()
     allowed = {

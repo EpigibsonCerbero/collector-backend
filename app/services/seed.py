@@ -11,7 +11,7 @@ from typing import Any
 from pymongo.database import Database
 
 from app.config import get_settings
-from app.security import hash_password
+from app.security import hash_password, verify_password
 
 BRANDS = [
     ("Hot Wheels", "hot-wheels", "United States", "1:64"),
@@ -38,9 +38,25 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+_PUBLIC_DEFAULT_ADMIN_PASSWORD = "AdminDev123!"
+
+
 def seed_admin(db: Database) -> None:
     s = get_settings()
-    if db.users.find_one({"email": s.seed_admin_email.lower()}):
+    existing = db.users.find_one({"email": s.seed_admin_email.lower()})
+    if existing:
+        # La contraseña por defecto está en el repo: una cuenta con ella es de
+        # cualquiera. Se desactiva (y se cierran sus sesiones).
+        if existing.get("is_active", True) and verify_password(
+            _PUBLIC_DEFAULT_ADMIN_PASSWORD, existing.get("pwd_hash", "")
+        ):
+            db.users.update_one(
+                {"_id": existing["_id"]},
+                {"$set": {"is_active": False}, "$inc": {"token_version": 1}},
+            )
+            print(f"[seed] admin {s.seed_admin_email} desactivado: usaba la contraseña pública")
+        return
+    if s.seed_admin_password == _PUBLIC_DEFAULT_ADMIN_PASSWORD:
         return
     now = _now()
     res = db.users.insert_one(

@@ -54,93 +54,34 @@ async def register_push_token(
     return NotificationOut(success=True, message="Token registrado")
 
 
-@router.post("/send", response_model=NotificationOut)
-async def send_notification(
-    body: SendNotification,
-    user: CurrentUser = Depends(get_current_user),
-) -> NotificationOut:
-    """Envía una push notification a otro usuario via Expo."""
-    db = get_db()
+def send_push(db, user_id: str, title: str, body: str, data: dict | None = None) -> None:
+    """Push al usuario si registró token. En un hilo: nunca frena la petición.
 
-    # Buscar token del destinatario
-    token_doc = db.user_push_tokens.find_one({"user_id": body.to_user_id})
-    if not token_doc:
-        return NotificationOut(success=False, message="Usuario sin token registrado")
-
-    push_token = token_doc["push_token"]
-
-    # Enviar via Expo Push API
+    Antes existían /send y /send-bulk: cualquier usuario mandaba pushes con
+    cualquier texto a cualquiera (spam/phishing). Ahora solo el servidor
+    notifica, desde `alerts.notify()`.
+    """
+    try:
+        doc = db.user_push_tokens.find_one({"user_id": user_id})
+    except Exception:
+        return
+    if not doc or not doc.get("push_token"):
+        return
     payload = {
-        "to": push_token,
-        "title": body.title,
-        "body": body.body,
-        "data": body.data,
+        "to": doc["push_token"],
+        "title": title,
+        "body": body,
+        "data": data or {},
         "sound": "default",
         "channelId": "default",
     }
 
-    try:
-        async with httpx.AsyncClient() as client:
-            res = await client.post(
-                EXPO_PUSH_URL,
-                json=payload,
-                headers={"Content-Type": "application/json"},
-            )
-            result = res.json()
-            if res.status_code == 200:
-                return NotificationOut(success=True, message="Notificación enviada")
-            else:
-                return NotificationOut(success=False, message=f"Error Expo: {result}")
-    except Exception as exc:
-        return NotificationOut(success=False, message=f"Error: {str(exc)}")
+    def _go() -> None:
+        try:
+            httpx.post(EXPO_PUSH_URL, json=payload, timeout=8)
+        except Exception:
+            pass
 
+    import threading
 
-@router.post("/send-bulk", response_model=NotificationOut)
-async def send_bulk(
-    body: dict,
-    user: CurrentUser = Depends(get_current_user),
-) -> NotificationOut:
-    """
-    Envía notificaciones a múltiples usuarios.
-    body: {"user_ids": [...], "title": "...", "body": "...", "data": {...}}
-    """
-    user_ids = body.get("user_ids", [])
-    title = body.get("title", "")
-    message = body.get("body", "")
-    data = body.get("data", {})
-
-    if not user_ids:
-        return NotificationOut(success=False, message="No hay destinatarios")
-
-    db = get_db()
-    tokens = list(db.user_push_tokens.find({"user_id": {"$in": user_ids}}))
-
-    if not tokens:
-        return NotificationOut(success=False, message="Sin tokens registrados")
-
-    # Enviar batch via Expo (hasta 100 por request)
-    messages = [
-        {
-            "to": t["push_token"],
-            "title": title,
-            "body": message,
-            "data": data,
-            "sound": "default",
-            "channelId": "default",
-        }
-        for t in tokens
-    ]
-
-    try:
-        async with httpx.AsyncClient() as client:
-            res = await client.post(
-                EXPO_PUSH_URL,
-                json=messages,
-                headers={"Content-Type": "application/json"},
-            )
-            if res.status_code == 200:
-                return NotificationOut(success=True, message=f"Enviadas a {len(messages)} usuarios")
-            else:
-                return NotificationOut(success=False, message=f"Error Expo: {res.text}")
-    except Exception as exc:
-        return NotificationOut(success=False, message=f"Error: {str(exc)}")
+    threading.Thread(target=_go, daemon=True).start()

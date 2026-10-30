@@ -30,9 +30,23 @@ def _collection_out(doc: dict) -> CollectionOut:
     return CollectionOut(**data)
 
 
+def _sanitize_images(images: list | None) -> list:
+    """Los base64 embebidos (data:...) de 1 MB reventaban /garage/items: el
+    móvil no terminaba de parsear y el garaje salía vacío. Solo se sirven URLs
+    remotas y rutas locales cortas (para el heal de fotos)."""
+    out: list = []
+    for u in images or []:
+        s = u if isinstance(u, str) else ""
+        if s.startswith("data:") and len(s) > 2048:
+            continue
+        out.append(s)
+    return out
+
+
 def _user_item_out(db, doc: dict, with_variant: bool = True) -> UserItemOut:
     data = serialize(doc)
     assert data is not None
+    data["custom_images"] = _sanitize_images(data.get("custom_images"))
     if with_variant and data.get("item_variant_id"):
         from app.routers.catalog import _load_master, _variant_out
 
@@ -40,6 +54,40 @@ def _user_item_out(db, doc: dict, with_variant: bool = True) -> UserItemOut:
         if v:
             data["item_variant"] = _variant_out(v, _load_master(db, v))
     return UserItemOut(**data)
+
+
+def _user_items_out(db, docs: list[dict]) -> list[UserItemOut]:
+    """Igual que `_user_item_out` en lote: 2 consultas en total (variantes y
+    maestros con $in) en vez de 2 por pieza. Con Atlas cada viaje cuesta
+    150-1.200 ms en frío: un garaje de 300 piezas tardaba minutos."""
+    from app.routers.catalog import _variant_out
+
+    vids = {d.get("item_variant_id") for d in docs if d.get("item_variant_id")}
+    keys = []
+    for v in vids:
+        try:
+            keys.append(as_id(v))
+        except Exception:
+            keys.append(v)
+    variants = {str(v["_id"]): v for v in db.variants.find({"_id": {"$in": keys}})} if keys else {}
+    mids = set()
+    for v in variants.values():
+        if v.get("item_master_id"):
+            try:
+                mids.add(as_id(v["item_master_id"]))
+            except Exception:
+                mids.add(v["item_master_id"])
+    masters = {str(m["_id"]): m for m in db.items.find({"_id": {"$in": list(mids)}})} if mids else {}
+    out = []
+    for d in docs:
+        data = serialize(d)
+        assert data is not None
+        data["custom_images"] = _sanitize_images(data.get("custom_images"))
+        v = variants.get(str(data.get("item_variant_id")))
+        if v:
+            data["item_variant"] = _variant_out(v, masters.get(str(v.get("item_master_id"))))
+        out.append(UserItemOut(**data))
+    return out
 
 
 def _own_collection(db, collection_id: str, user_id: str) -> dict:
@@ -120,7 +168,7 @@ def list_collection_items(
     db = get_db()
     _own_collection(db, collection_id, user.id)
     docs = list(db.user_items.find({"collection_id": collection_id}).sort("created_at", -1))
-    return [_user_item_out(db, d) for d in docs]
+    return _user_items_out(db, docs)
 
 
 # ── Piezas del garaje ─────────────────────────────────────────────────────
@@ -128,8 +176,9 @@ def list_collection_items(
 
 @router.get("/garage/items", response_model=list[UserItemOut])
 def list_all_user_items(user: CurrentUser = Depends(get_current_user)) -> list[UserItemOut]:
-    docs = list(get_db().user_items.find({"user_id": user.id}).sort("created_at", -1))
-    return [_user_item_out(get_db(), d) for d in docs]
+    db = get_db()
+    docs = list(db.user_items.find({"user_id": user.id}).sort("created_at", -1))
+    return _user_items_out(db, docs)
 
 
 @router.post("/garage/items", response_model=UserItemOut, status_code=201)
@@ -143,6 +192,7 @@ def add_collectible(
         raise HTTPException(status_code=404, detail="Variante no encontrada")
 
     doc = body.model_dump()
+    doc["custom_images"] = _sanitize_images(doc.get("custom_images"))
     doc.update(
         {
             "user_id": user.id,
@@ -196,6 +246,8 @@ def update_user_item(
     if not doc or doc.get("user_id") != user.id:
         raise HTTPException(status_code=404, detail="Pieza no encontrada")
     updates = {k: v for k, v in body.model_dump(exclude_none=True).items()}
+    if "custom_images" in updates:
+        updates["custom_images"] = _sanitize_images(updates.get("custom_images"))
     updates["updated_at"] = _now()
     doc = db.user_items.find_one_and_update(
         {"_id": as_id(item_id)},

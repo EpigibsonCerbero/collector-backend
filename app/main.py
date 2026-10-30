@@ -1,6 +1,8 @@
 """FastAPI application entrypoint — CollectorManager API."""
 from __future__ import annotations
 
+import os
+
 import asyncio
 import ipaddress
 import json
@@ -36,9 +38,35 @@ async def lifespan(_: FastAPI):
     yield
 
 
+_LAB_STREAMS = {"n": 0}
+
+
 def create_app() -> FastAPI:
     settings = get_settings()
     app = FastAPI(title=settings.app_name, version="0.1.0", lifespan=lifespan)
+
+    # /lab* expone el debug de TODOS los identify (texto leído de fotos de
+    # usuarios). Con LAB_PASSWORD definido exige usuario/contraseña (HTTP Basic:
+    # el navegador lo pide una vez y lo reenvía al stream y al proxy).
+    @app.middleware("http")
+    async def _lab_guard(request, call_next):
+        if request.url.path.startswith("/lab") and os.environ.get("LAB_PASSWORD"):
+            import base64 as _b64
+            import secrets as _secrets
+
+            ok = False
+            auth_h = request.headers.get("authorization", "")
+            if auth_h.lower().startswith("basic "):
+                try:
+                    user, _, pwd = _b64.b64decode(auth_h[6:]).decode().partition(":")
+                    ok = _secrets.compare_digest(pwd, os.environ["LAB_PASSWORD"]) and _secrets.compare_digest(
+                        user, os.environ.get("LAB_USER", "lab")
+                    )
+                except Exception:
+                    ok = False
+            if not ok:
+                return Response(status_code=401, headers={"WWW-Authenticate": 'Basic realm="Identify Lab"'})
+        return await call_next(request)
 
     api = "/api/v1"
     app.include_router(auth.router, prefix=api)
@@ -150,9 +178,15 @@ def create_app() -> FastAPI:
         """
         from app.services import debug_bus
 
-        q = debug_bus.subscribe(warm=80)
+        # Cada conexión es un bucle infinito: sin tope, abrir muchas tumbaba el servidor.
+        if _LAB_STREAMS["n"] >= 5:
+            raise HTTPException(status_code=429, detail="Demasiadas consolas abiertas")
 
         async def gen():
+            # Alta y baja DENTRO del generador: si el cliente se va antes de
+            # empezar, no queda ni suscripción ni contador colgados.
+            _LAB_STREAMS["n"] += 1
+            q = debug_bus.subscribe(warm=80)
             try:
                 while True:
                     try:
@@ -164,6 +198,7 @@ def create_app() -> FastAPI:
                         await asyncio.sleep(0.35)
             finally:
                 debug_bus.unsubscribe(q)
+                _LAB_STREAMS["n"] -= 1
 
         return StreamingResponse(
             gen(),

@@ -12,6 +12,8 @@ from app.security import CurrentUser, get_current_user
 
 router = APIRouter(prefix="/missions", tags=["missions"])
 
+ALL_MISSIONS_BONUS_XP = 50
+
 LEVEL_THRESHOLDS = [0, 100, 250, 500, 800, 1200, 1800, 2500, 3500, 5000]
 
 DAILY_MISSION_TEMPLATES = [
@@ -95,8 +97,23 @@ def _ensure_daily_missions(db, user_id: str) -> list[dict]:
 def mission_state(user: CurrentUser = Depends(get_current_user)) -> MissionStateOut:
     db = get_db()
     missions = _ensure_daily_missions(db, user.id)
-    # Progreso de XP persistido en el perfil
+    # Racha: abrir las misiones cuenta como visita del día (antes nunca subía).
     profile = db.users.find_one({"_id": oid(user.id)}) or {}
+    today = date.today()
+    last_seen = profile.get("last_seen_date")
+    if last_seen != today.isoformat():
+        streak = int(profile.get("streak", 0))
+        try:
+            gap = (today - date.fromisoformat(last_seen)).days if last_seen else None
+        except ValueError:
+            gap = None
+        streak = streak + 1 if gap == 1 else 1
+        longest = max(int(profile.get("longest_streak", 0)), streak)
+        db.users.update_one(
+            {"_id": oid(user.id)},
+            {"$set": {"last_seen_date": today.isoformat(), "streak": streak, "longest_streak": longest}},
+        )
+        profile = {**profile, "streak": streak, "longest_streak": longest}
     total_xp = int(profile.get("total_xp", 0))
     level, xp_next, next_th = _level_for(total_xp)
     return MissionStateOut(
@@ -161,4 +178,12 @@ def claim_mission(
             "$set": {"last_active_date": _today(), "updated_at": _now()},
         },
     )
+    # Bono +50 XP al completar TODAS las del día, una sola vez (antes solo se
+    # sumaba en el teléfono y se repetía cada vez que abrías la pantalla).
+    pending = db.missions.count_documents({"user_id": user.id, "date": doc.get("date"), "completed": {"$ne": True}})
+    if pending == 0:
+        db.users.update_one(
+            {"_id": oid(user.id), "missions_bonus_date": {"$ne": doc.get("date")}},
+            {"$inc": {"total_xp": ALL_MISSIONS_BONUS_XP}, "$set": {"missions_bonus_date": doc.get("date")}},
+        )
     return MissionOut(**serialize(doc))  # type: ignore[arg-type]
