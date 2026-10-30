@@ -1115,3 +1115,148 @@ def test_bookkeeping_failure_after_create_is_not_500(rn, monkeypatch):
     r = _post()
     assert r.status_code == 200 and r.json()["method"] == "o" and _rows() == 1
     assert _db.identify_receipts.count_documents({}) == 0
+
+
+# ── Task 6: verificación comunitaria ───────────────────────────────────────
+
+from bson import ObjectId as _OID
+
+from app.routers import garage as _garage
+
+
+def _ai_piece(_id="ai1", created_by="u1", **kw):
+    _db.variants.delete_many({})
+    d = {"_id": _id, "origin": "ai", "verified": False, "created_by": created_by,
+         "confirmed_by": [], "variant_name": "Bayside Blue", "ai_local_hash": "h" + _id}
+    d.update(kw)
+    _db.variants.insert_one(d)
+    return _id
+
+
+def _v(_id="ai1"):
+    return _db.variants.find_one({"_id": _id})
+
+
+def test_creator_alone_does_not_verify():
+    _ai_piece()
+    assert aic.confirm(_db, "ai1", "u1") is False
+    assert _v()["verified"] is False and _v()["confirmed_by"] == []
+
+
+def test_second_distinct_user_verifies():
+    _ai_piece()
+    assert aic.confirm(_db, "ai1", "u2") is True
+    assert _v()["verified"] is True and _v()["confirmed_by"] == ["u2"]
+    assert aic.confirm(_db, "ai1", "u3") is False  # ya verificada: no vuelve a True
+    assert _v()["verified"] is True
+
+
+def test_same_user_twice_counts_once():
+    _ai_piece(created_by=None)
+    assert aic.confirm(_db, "ai1", "u2") is False
+    assert aic.confirm(_db, "ai1", "u2") is False
+    assert _v()["verified"] is False and _v()["confirmed_by"] == ["u2"]
+    assert aic.confirm(_db, "ai1", "u3") is True
+
+
+def test_two_non_creators_verify_without_creator():
+    _ai_piece(created_by=None)
+    assert aic.confirm(_db, "ai1", "a") is False
+    assert aic.confirm(_db, "ai1", "b") is True
+
+
+def test_confirm_ignores_non_ai_pieces(monkeypatch):
+    _db.variants.delete_many({})
+    _db.variants.insert_one({"_id": "s1", "variant_name": "x"})
+    _db.variants.insert_one({"_id": "s2", "origin": "scrape", "verified": True})
+    calls = []
+    real = _db.variants.update_one
+    assert aic.confirm(_db, "s1", "u2") is False and aic.confirm(_db, "s2", "u2") is False
+    assert aic.confirm(_db, "missing", "u2") is False
+    assert "confirmed_by" not in _v("s1") and "confirmed_by" not in _v("s2")
+
+
+def test_confirm_never_raises():
+    class Boom:
+        class variants:
+            @staticmethod
+            def find_one(*a, **k):
+                raise RuntimeError("down")
+
+    assert aic.confirm(Boom, "x", "u") is False
+
+
+def test_identify_winner_ai_confirms(monkeypatch):
+    _ai_piece()
+
+    def run(data, brand):
+        idn._note_ai(_v())
+        return idn.IdentifyOut(needs_manual=False)
+
+    monkeypatch.setattr(idn, "_run_identify", run)
+    asyncio.run(idn._identify_guarded(None, IMG, None, CurrentUser({"id": "u2"})))
+    assert _v()["verified"] is True
+
+
+def test_identify_hook_skips_verified_and_non_ai(monkeypatch):
+    _ai_piece(verified=True)
+    seen = []
+    monkeypatch.setattr(aic, "confirm", lambda *a: seen.append(a))
+
+    def run(data, brand):
+        idn._note_ai(_v())
+        idn._note_ai({"_id": "s1", "variant_name": "x"})
+        return idn.IdentifyOut(needs_manual=False)
+
+    monkeypatch.setattr(idn, "_run_identify", run)
+    asyncio.run(idn._identify_guarded(None, IMG, None, CurrentUser({"id": "u2"})))
+    assert seen == []
+
+
+def test_identify_confirm_failure_does_not_break(monkeypatch):
+    _ai_piece()
+    monkeypatch.setattr(aic, "confirm", lambda *a: (_ for _ in ()).throw(RuntimeError("x")))
+
+    def run(data, brand):
+        idn._note_ai(_v())
+        return idn.IdentifyOut(needs_manual=False)
+
+    monkeypatch.setattr(idn, "_run_identify", run)
+    out = asyncio.run(idn._identify_guarded(None, IMG, None, CurrentUser({"id": "u2"})))
+    assert out.needs_manual is False
+
+
+@pytest.fixture
+def gar(monkeypatch):
+    monkeypatch.setattr(_garage, "get_db", lambda: _db)
+    app = _FastAPI()
+    app.include_router(_garage.router, prefix="/api/v1")
+    who = {"id": "u2"}
+    app.dependency_overrides[_gcu] = lambda: CurrentUser({"id": who["id"], "username": who["id"]})
+    for c in ("collections", "user_items", "user_lists", "user_list_items", "items"):
+        _db[c].delete_many({})
+    coll = _db.collections.insert_one({"user_id": "u2", "name": "c"}).inserted_id
+    return _TC(app), str(coll)
+
+
+def test_garage_add_confirms_and_does_not_leak(gar):
+    client, coll = gar
+    _ai_piece(item_master_id="m1")
+    r = client.post("/api/v1/garage/items", json={"collection_id": coll, "item_variant_id": "ai1"})
+    assert r.status_code == 201
+    assert _v()["verified"] is True
+    iv = r.json()["item_variant"]
+    for k in ("origin", "verified", "confirmed_by", "created_by"):
+        assert k not in iv
+
+
+def test_garage_add_non_ai_no_write_and_confirm_failure_ok(gar, monkeypatch):
+    client, coll = gar
+    _db.variants.delete_many({})
+    _db.variants.insert_one({"_id": "s1", "variant_name": "x", "ai_local_hash": "hs1", "item_master_id": "m1"})
+    r = client.post("/api/v1/garage/items", json={"collection_id": coll, "item_variant_id": "s1"})
+    assert r.status_code == 201 and "confirmed_by" not in _v("s1")
+    _ai_piece(item_master_id="m1")
+    monkeypatch.setattr(aic, "confirm", lambda *a: (_ for _ in ()).throw(RuntimeError("x")))
+    r = client.post("/api/v1/garage/items", json={"collection_id": coll, "item_variant_id": "ai1"})
+    assert r.status_code == 201

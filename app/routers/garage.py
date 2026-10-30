@@ -1,6 +1,8 @@
 """Garaje: colecciones y piezas del usuario (user_items)."""
 from __future__ import annotations
 
+import logging
+
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -188,7 +190,8 @@ def add_collectible(
 ) -> UserItemOut:
     db = get_db()
     _own_collection(db, body.collection_id, user.id)
-    if not db.variants.find_one({"_id": as_id(body.item_variant_id)}):
+    variant_doc = db.variants.find_one({"_id": as_id(body.item_variant_id)})
+    if not variant_doc:
         raise HTTPException(status_code=404, detail="Variante no encontrada")
 
     doc = body.model_dump()
@@ -204,6 +207,14 @@ def add_collectible(
     )
     res = db.user_items.insert_one(doc)
     doc["_id"] = res.inserted_id
+
+    if variant_doc.get("origin") == "ai":
+        try:
+            from app.services import ai_catalog
+
+            ai_catalog.confirm(db, body.item_variant_id, user.id)
+        except Exception:  # noqa: BLE001
+            logging.getLogger(__name__).warning("ai_catalog: confirm falló", exc_info=True)
 
     # Auto-remover de wishlists con auto_remove_on_garage_add
     db.user_list_items.delete_many(

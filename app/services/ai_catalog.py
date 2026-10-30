@@ -552,6 +552,39 @@ def create_from_read(db, user_id: str, read: dict, image_bytes: bytes) -> dict:
     return out
 
 
+def confirm(db, variant_id: str, user_id: str) -> bool:
+    """Confirmación comunitaria de una pieza de IA. Nunca lanza.
+
+    El creador cuenta como primer confirmador: la pieza pasa a `verified` con
+    >= 2 usuarios DISTINTOS en {created_by} ∪ confirmed_by. Idempotente, nunca
+    desverifica. Solo `origin == "ai"`; el resto no se toca (sin escritura).
+    True solo si ESTA llamada puso `verified=True`."""
+    try:
+        doc = _resolve_variant(db, variant_id)
+        if not doc or doc.get("origin") != "ai" or not user_id:
+            return False
+        if doc.get("verified") is True:
+            return False
+        creator = doc.get("created_by")
+        users = {str(u) for u in (doc.get("confirmed_by") or [])}
+        if creator:
+            users.add(str(creator))
+        if str(user_id) in users:
+            return False  # el creador o quien ya confirmó: nada cambia
+        users.add(str(user_id))
+        db.variants.update_one({"_id": doc["_id"]}, {"$addToSet": {"confirmed_by": str(user_id)}})
+        if len(users) < 2:
+            return False
+        res = db.variants.update_one(
+            {"_id": doc["_id"], "origin": "ai", "verified": {"$ne": True}},
+            {"$set": {"verified": True}},
+        )
+        return res.modified_count == 1
+    except Exception:  # noqa: BLE001
+        _log.warning("ai_catalog: confirm falló variant=%s", variant_id, exc_info=True)
+        return False
+
+
 def strip_internal(doc: dict) -> dict:
     """Copia sin los campos internos de moderación (no muta la entrada)."""
     return {k: v for k, v in doc.items() if k not in _INTERNAL}

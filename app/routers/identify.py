@@ -8,6 +8,7 @@ del cliente para que el cambio sea transparente.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import base64
 import hashlib
 import io
@@ -537,6 +538,41 @@ def _toy_confusions(toy: str) -> list[str]:
     return out
 
 
+# Piezas de IA sin verificar que ganaron este identify. La fija el wrapper async
+# (el contexto se copia a to_thread: la lista es la MISMA); sin ella, no-op.
+_AI_WINNERS: contextvars.ContextVar = contextvars.ContextVar("ai_winners", default=None)
+
+
+def _note_ai(doc) -> None:
+    """Anota el doc ganador solo si es IA sin verificar (sin tocar Mongo)."""
+    try:
+        lst = _AI_WINNERS.get()
+        if lst is not None and doc and doc.get("origin") == "ai" and doc.get("verified") is not True:
+            lst.append(str(doc["_id"]))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _confirm_ai(db, uid: str, ids: list) -> None:
+    for vid in dict.fromkeys(ids):
+        try:
+            ai_catalog.confirm(db, vid, uid)
+        except Exception:  # noqa: BLE001
+            _log.warning("ai_catalog: confirm falló", exc_info=True)
+
+
+async def _run_confirming(db, uid: str, data: bytes, brand):
+    winners: list = []
+    tok = _AI_WINNERS.set(winners)
+    try:
+        out = await asyncio.to_thread(_run_identify, data, brand)
+    finally:
+        _AI_WINNERS.reset(tok)
+    if winners:
+        await asyncio.to_thread(_confirm_ai, db, uid, winners)
+    return out
+
+
 def _run_identify(image_bytes: bytes, brand: str | None = None) -> IdentifyOut:
     if not image_bytes or len(image_bytes) < 100:
         raise HTTPException(status_code=400, detail="Imagen vacía o inválida")
@@ -617,6 +653,7 @@ def _run_identify(image_bytes: bytes, brand: str | None = None) -> IdentifyOut:
         if doc:
             out.method = "b"
             out.item = _variant_out(doc, master)
+            _note_ai(doc)
             out.needs_manual = False
             out.confidence = 0.99
             _dbg("mongo", f"HIT por UPC → {(doc.get('variant_name') or doc.get('name'))!r}")
@@ -648,6 +685,7 @@ def _run_identify(image_bytes: bytes, brand: str | None = None) -> IdentifyOut:
             if doc:
                 out.method = "c"
                 out.item = _variant_out(doc, master)
+                _note_ai(doc)
                 out.toy_number = top.toy or out.toy_number
                 out.needs_manual = False
                 out.confidence = float(max(0.0, min(1.0, top.score)))
@@ -664,6 +702,7 @@ def _run_identify(image_bytes: bytes, brand: str | None = None) -> IdentifyOut:
         if doc:
             out.method = "o"
             out.item = _variant_out(doc, master)
+            _note_ai(doc)
             out.needs_manual = False
             out.confidence = 0.95
             _dbg("mongo", f"HIT por toy_number → {(doc.get('variant_name') or doc.get('name'))!r}")
@@ -677,6 +716,7 @@ def _run_identify(image_bytes: bytes, brand: str | None = None) -> IdentifyOut:
             if doc and _name_hits(doc.get("variant_name") or "", ocr_compact)[2] >= 2:
                 out.method = "o"
                 out.item = _variant_out(doc, master)
+                _note_ai(doc)
                 out.toy_number = alt
                 out.needs_manual = False
                 out.confidence = 0.9
@@ -712,6 +752,7 @@ def _run_identify(image_bytes: bytes, brand: str | None = None) -> IdentifyOut:
         if doc:
             out.method = "o"
             out.item = _variant_out(doc, master)
+            _note_ai(doc)
             out.toy_number = name_match[1]
             out.needs_manual = False
             out.confidence = 0.9
@@ -756,6 +797,7 @@ def _run_identify(image_bytes: bytes, brand: str | None = None) -> IdentifyOut:
         if doc:
             out.method = "c"
             out.item = _variant_out(doc, master)
+            _note_ai(doc)
             out.toy_number = top.toy or out.toy_number
             out.needs_manual = False
             out.confidence = res.confidence
@@ -773,6 +815,7 @@ def _run_identify(image_bytes: bytes, brand: str | None = None) -> IdentifyOut:
                 master = db.items.find_one({"_id": mid}) if mid else None
                 out.method = "c"
                 out.item = _variant_out(doc2, master)
+                _note_ai(doc2)
                 out.toy_number = top.toy or doc2.get("toy_number") or out.toy_number
                 out.needs_manual = False
                 out.confidence = res.confidence
@@ -911,7 +954,7 @@ async def _identify_guarded(
     st = get_settings()
     if not st.scan_limit_enabled:
         async with _IDENTIFY_SLOTS:
-            out = await asyncio.to_thread(_run_identify, data, brand)
+            out = await _run_confirming(get_db(), uid, data, brand)
         await _maybe_receipt(get_db(), uid, data, out)
         return out
 
@@ -948,7 +991,7 @@ async def _identify_guarded(
             _log.info("scan_free user=%s used=%d/%d", uid, used, st.free_daily_scans)
 
         async with _IDENTIFY_SLOTS:
-            out = await asyncio.to_thread(_run_identify, data, brand)
+            out = await _run_confirming(db, uid, data, brand)
         if held["reserved"] and out.item is None and not out.suggestions:
             await asyncio.to_thread(subs.release_scan, db, uid)
             held["reserved"] = False
