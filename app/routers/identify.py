@@ -1161,13 +1161,27 @@ def _mark_ai_tried(db, receipt: dict) -> None:
         _log.warning("ai_catalog: no se pudo marcar el recibo", exc_info=True)
 
 
-def _create_piece(db, uid: str, read: dict, data: bytes, receipt: dict) -> tuple[str, dict | None]:
-    """(decisión para el log, pieza o None). Recorte + embed + Mongo: CPU, va bajo el semáforo."""
+async def _create_piece(db, uid: str, read: dict, data: bytes, receipt: dict) -> tuple[str, dict | None]:
+    """(decisión para el log, pieza o None). Solo el recorte + embedding (CPU)
+    y el alta toman `_IDENTIFY_SLOTS`; la comprobación anti-duplicado (texto +
+    índice, hasta segundos) corre fuera para no frenar los identify."""
     try:
-        piece = ai_catalog.create_from_read(db, uid, read, data)
+        async with _IDENTIFY_SLOTS:
+            prep = await asyncio.to_thread(ai_catalog.prepare_image, data)
+        chk = await asyncio.to_thread(ai_catalog.check_duplicate, db, read, prep.crop_vec)
+        if chk.outcome == "new":
+            async with _IDENTIFY_SLOTS:
+                piece = await asyncio.to_thread(ai_catalog.create_new, db, uid, read, prep)
+        else:
+            piece = ai_catalog.check_result(chk)
     except Exception:  # noqa: BLE001
         _log.warning("ai_catalog: alta fallida user=%s", uid, exc_info=True)
         return "uncertain:error", None
+    return await asyncio.to_thread(_finish_piece, db, uid, piece, receipt)
+
+
+def _finish_piece(db, uid: str, piece: dict, receipt: dict) -> tuple[str, dict | None]:
+    """Contabilidad tras el alta (tope de altas, recibo) y respuesta sin campos internos."""
     outcome = piece.get("outcome")
     if outcome not in ("created", "duplicate"):
         return f"uncertain:{piece.get('reason') or 'unknown'}", None
@@ -1229,8 +1243,7 @@ async def identify_resolve_new(
     decision, read = await asyncio.to_thread(_read_and_gate, data, receipt)
     piece = None
     if decision is None:
-        async with _IDENTIFY_SLOTS:
-            decision, piece = await asyncio.to_thread(_create_piece, db, uid, read, data, receipt)
+        decision, piece = await _create_piece(db, uid, read, data, receipt)
     if read is not None and piece is None:
         await asyncio.to_thread(_mark_ai_tried, db, receipt)
     _log.info("ai_catalog %s user=%s", decision, uid)

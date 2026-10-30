@@ -1063,21 +1063,35 @@ def test_does_not_consume_extra_scan_quota(rn, monkeypatch):
 def test_ai_read_does_not_hold_identify_slot(rn, monkeypatch):
     seen = {}
     real_read = cv.read_for_catalog
-    real_create = aic.create_from_read
 
-    def read_spy(data):
-        seen["read"] = idn._IDENTIFY_SLOTS._value
-        return real_read(data)
+    def spy(name, fn):
+        def run(*a, **k):
+            seen[name] = idn._IDENTIFY_SLOTS._value
+            return fn(*a, **k)
+        return run
 
-    def create_spy(*a, **k):
-        seen["create"] = idn._IDENTIFY_SLOTS._value
-        return real_create(*a, **k)
-
-    monkeypatch.setattr(cv, "read_for_catalog", read_spy)
-    monkeypatch.setattr(aic, "create_from_read", create_spy)
+    monkeypatch.setattr(cv, "read_for_catalog", spy("read", real_read))
+    monkeypatch.setattr(aic, "prepare_image", spy("prepare", aic.prepare_image))
+    monkeypatch.setattr(aic, "check_duplicate", spy("dup", aic.check_duplicate))
+    monkeypatch.setattr(aic, "create_new", spy("create", aic.create_new))
     _receipt()
     assert _post().json()["method"] == "o"
-    assert seen == {"read": 2, "create": 1}  # solo el alta (CPU) toma el semáforo
+    # Solo el recorte/embedding (CPU) y el alta toman el semáforo; la lectura y
+    # la comprobación anti-duplicado (texto + índice, hasta segundos) no.
+    assert seen == {"read": 2, "prepare": 1, "dup": 2, "create": 1}
+
+
+def test_duplicate_path_never_takes_second_slot(rn, monkeypatch):
+    _seed_variant(toy="MGT09999")
+    called = []
+    monkeypatch.setattr(aic, "create_new", lambda *a, **k: called.append(1))
+    _receipt()
+    j = _post().json()
+    assert j["item"]["id"] == "exist1" and called == []
+
+
+def test_dup_text_budget_is_3s():
+    assert aic.DUP_TEXT_BUDGET_S == 3.0
 
 
 def test_replay_after_gate_rejection_makes_no_ai_call(rn):

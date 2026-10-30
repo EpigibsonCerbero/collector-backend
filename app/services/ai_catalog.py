@@ -61,7 +61,7 @@ _INTERNAL = MODERATION_FIELDS + ("created", "outcome", "reason")
 
 # Presupuesto de la búsqueda textual anti-duplicado. Corre fuera del identify
 # (no cuenta contra sus 8 s); si aun así se agota, el resultado es «incierto».
-DUP_TEXT_BUDGET_S = 6.0
+DUP_TEXT_BUDGET_S = 3.0
 
 # Colores base (es/en) → canónico, para comparar lecturas con el catálogo.
 _COLORS = {
@@ -553,34 +553,62 @@ def _append_live(entry: dict, vec) -> None:
         _log.warning("ai_catalog: no se pudo añadir al índice vivo (%s)", entry, exc_info=True)
 
 
-def create_from_read(db, user_id: str, read: dict, image_bytes: bytes) -> dict:
-    """Crea la pieza (o devuelve la existente). Salida: ver `_piece_out`.
+@dataclass
+class Prepared:
+    """Trabajo de CPU sobre la foto (decodificar, aislar el coche, embedding
+    del recorte). Es lo único del alta que debe ir bajo `_IDENTIFY_SLOTS`."""
 
-    No comprueba `gate` ni el tope: eso es del llamador."""
+    im: object
+    crop: object | None
+    crop_vec: list[float] | None
+
+
+def prepare_image(image_bytes: bytes) -> Prepared:
     from PIL import Image
 
-    from app.routers.catalog import _upsert_catalog_piece
     from app.services import car_segment, dinov2_embed
 
-    read = sanitize_read(read)
-    if read is None:
-        return {"outcome": "uncertain", "reason": "unsafe_text", "created": False}
     im = Image.open(io.BytesIO(image_bytes))
     im.load()
     im = im.convert("RGB")
-
     seg = car_segment.isolate_car(im)
     crop = seg.image if seg is not None else None
     crop_vec = dinov2_embed.embed_image(crop) if crop is not None else None
+    return Prepared(im=im, crop=crop, crop_vec=crop_vec)
 
-    chk = check_duplicate(db, read, crop_vec)
+
+def check_result(chk: DupCheck) -> dict:
+    """Salida de `create_from_read` para un `check_duplicate` que no es "new"."""
     if chk.outcome == "duplicate":
         return {**chk.piece, "outcome": "duplicate", "reason": chk.reason}
-    if chk.outcome == "uncertain":
-        # No se escribe nada (ni imagen, ni Mongo, ni índice): el llamador
-        # devuelve el flujo manual.
-        return {"outcome": "uncertain", "reason": chk.reason, "created": False}
+    # No se escribe nada (ni imagen, ni Mongo, ni índice): el llamador
+    # devuelve el flujo manual.
+    return {"outcome": "uncertain", "reason": chk.reason, "created": False}
 
+
+def create_from_read(db, user_id: str, read: dict, image_bytes: bytes) -> dict:
+    """Crea la pieza (o devuelve la existente). Salida: ver `_piece_out`.
+
+    No comprueba `gate` ni el tope: eso es del llamador. Es la composición de
+    `prepare_image` (CPU) → `check_duplicate` (texto + índice, sin CPU
+    pesada) → `create_new` (alta); el endpoint llama a las tres por separado
+    para que la comprobación anti-duplicado no ocupe un slot del identify."""
+    read = sanitize_read(read)
+    if read is None:
+        return {"outcome": "uncertain", "reason": "unsafe_text", "created": False}
+    prep = prepare_image(image_bytes)
+    chk = check_duplicate(db, read, prep.crop_vec)
+    if chk.outcome != "new":
+        return check_result(chk)
+    return create_new(db, user_id, read, prep)
+
+
+def create_new(db, user_id: str, read: dict, prep: Prepared) -> dict:
+    """Alta de una lectura YA comprobada como nueva (`check_duplicate`)."""
+    from app.routers.catalog import _upsert_catalog_piece
+    from app.services import dinov2_embed
+
+    im, crop, crop_vec = prep.im, prep.crop, prep.crop_vec
     brand = _clean(read.get("brand"))
     casting = _clean(read.get("casting"))
     color = _clean(read.get("color"))
