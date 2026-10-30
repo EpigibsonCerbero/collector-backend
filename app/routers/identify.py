@@ -942,8 +942,9 @@ def image_hash(image_bytes: bytes) -> str:
     return hashlib.sha256(image_bytes).hexdigest()
 
 
-def write_receipt(db, user_id: str, image_bytes: bytes, top_score: float, twins: bool) -> None:
-    """Recibo de escaneo manual (TTL). Nunca lanza: no puede romper el identify."""
+def write_receipt(db, user_id: str, image_bytes: bytes, top_score: float, twins: bool) -> bool:
+    """Recibo de escaneo manual (TTL). Nunca lanza: no puede romper el identify.
+    True si quedó escrito."""
     try:
         db.identify_receipts.insert_one(
             {
@@ -954,21 +955,23 @@ def write_receipt(db, user_id: str, image_bytes: bytes, top_score: float, twins:
                 "created_at": datetime.now(timezone.utc),
             }
         )
+        return True
     except Exception:  # noqa: BLE001
         _log.warning("identify_receipt: no se pudo escribir", exc_info=True)
+        return False
 
 
 async def _maybe_receipt(db, uid: str, data: bytes, out: "IdentifyOut") -> None:
+    """Escribe el recibo y fija `debug["resolve_hint"]`: True solo si el flag
+    está activo, el recibo quedó escrito y pasa la barrera del recibo (sin
+    gemelos ni candidato visual creíble). La app solo pide el alta con True."""
+    out.debug["resolve_hint"] = False
     if not get_settings().ai_catalog_enabled or not out.needs_manual or out.item is not None:
         return
-    await asyncio.to_thread(
-        write_receipt,
-        db,
-        uid,
-        data,
-        out.debug.get("top_score", 0.0),
-        bool(out.debug.get("twins", False)),
-    )
+    top = out.debug.get("top_score", 0.0)
+    twins = bool(out.debug.get("twins", False))
+    written = await asyncio.to_thread(write_receipt, db, uid, data, top, twins)
+    out.debug["resolve_hint"] = bool(written) and ai_catalog.gate_receipt({"top_score": top, "twins": twins}) is None
 
 
 async def _identify_guarded(
@@ -1132,14 +1135,15 @@ def _valid_receipt(db, uid: str, ihash: str) -> dict | None:
 
 
 def _read_and_gate(data: bytes, receipt: dict) -> tuple[str | None, dict | None]:
-    """(motivo de rechazo o None, lectura). Red, sin CPU: va FUERA de `_IDENTIFY_SLOTS`."""
+    """(motivo de rechazo o None, lectura). Red, sin CPU: va FUERA de `_IDENTIFY_SLOTS`.
+    La barrera del recibo ya pasó antes de llegar aquí (sin coste)."""
     try:
         read = claude_vision.read_for_catalog(data)
     except Exception:  # noqa: BLE001
         read = None
     if read is None:
         return "no_ai", None
-    reason = ai_catalog.gate(read, receipt)
+    reason = ai_catalog.gate_read(read)
     return (f"rejected:{reason}", read) if reason else (None, read)
 
 
@@ -1196,6 +1200,11 @@ async def identify_resolve_new(
         raise HTTPException(status_code=403, detail="Escanea la pieza de nuevo")
     if receipt.get("ai_tried"):
         _log.info("ai_catalog rejected:ai_tried user=%s", uid)
+        return IdentifyOut()
+    # Barrera del recibo (gemelos / candidato visual creíble): sin llamar a la IA.
+    reason = ai_catalog.gate_receipt(receipt)
+    if reason:
+        _log.info("ai_catalog rejected:%s user=%s", reason, uid)
         return IdentifyOut()
     hit_or_429("resolve_new", uid, limit=6, per_seconds=600)
     if await asyncio.to_thread(ai_catalog.daily_cap_reached, db, uid):

@@ -142,17 +142,9 @@ def piece_id(source_id: str) -> str:
 # ── Barreras ───────────────────────────────────────────────────────────────
 
 
-def gate(read: dict | None, receipt: dict) -> str | None:
-    """Motivo de rechazo o None si se puede crear.
-
-    Un `top_score` ausente/0.0 (el identify salió a manual antes de puntuar)
-    NO es motivo para crear: siguen mandando diecast + confianza alta + identidad."""
-    if not read or read.get("es_diecast") is not True:
-        return "no_diecast"
-    if read.get("confidence") != "alto":
-        return "low_confidence"
-    if not str(read.get("brand") or "").strip() or not str(read.get("casting") or "").strip():
-        return "missing_identity"
+def gate_receipt(receipt: dict | None) -> str | None:
+    """Parte de la barrera que solo necesita el recibo (sin IA): gemelos o un
+    candidato visual creíble → "visual_candidate". Va ANTES de pagar la lectura."""
     rc = receipt or {}
     try:
         top = float(rc.get("top_score") or 0.0)
@@ -161,6 +153,25 @@ def gate(read: dict | None, receipt: dict) -> str | None:
     if rc.get("twins") or top >= get_settings().ai_catalog_max_top_score:
         return "visual_candidate"
     return None
+
+
+def gate_read(read: dict | None) -> str | None:
+    """Parte de la barrera que necesita la lectura: diecast, confianza, identidad."""
+    if not read or read.get("es_diecast") is not True:
+        return "no_diecast"
+    if read.get("confidence") != "alto":
+        return "low_confidence"
+    if not str(read.get("brand") or "").strip() or not str(read.get("casting") or "").strip():
+        return "missing_identity"
+    return None
+
+
+def gate(read: dict | None, receipt: dict) -> str | None:
+    """Motivo de rechazo o None si se puede crear (`gate_read` + `gate_receipt`).
+
+    Un `top_score` ausente/0.0 (el identify salió a manual antes de puntuar)
+    NO es motivo para crear: siguen mandando diecast + confianza alta + identidad."""
+    return gate_read(read) or gate_receipt(receipt)
 
 
 def _load_master(db, doc: dict) -> dict | None:

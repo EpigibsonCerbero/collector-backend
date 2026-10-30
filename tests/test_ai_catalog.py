@@ -1010,6 +1010,7 @@ def test_gate_rejection_returns_manual(rn):
     _receipt(twins=True)
     r = _post()
     assert r.status_code == 200 and _is_manual(r.json()) and _rows() == 0
+    assert rn["calls"] == []  # barrera del recibo: sin lectura pagada
     rn["read"] = _read(es_diecast=False)
     _receipt(img=_jpeg((1, 2, 3)))
     assert _is_manual(_post(img=_jpeg((1, 2, 3))).json()) and _rows() == 0
@@ -1080,7 +1081,14 @@ def test_ai_read_does_not_hold_identify_slot(rn, monkeypatch):
 
 
 def test_replay_after_gate_rejection_makes_no_ai_call(rn):
+    # Barrera del recibo (gemelos): ni la primera vez se paga la lectura.
     _receipt(twins=True)
+    assert _is_manual(_post().json()) and rn["calls"] == []
+    assert _is_manual(_post().json()) and rn["calls"] == []
+    # Barrera de la lectura (no es diecast): una lectura y nunca más.
+    _db.identify_receipts.delete_many({})
+    rn["read"] = _read(es_diecast=False)
+    _receipt()
     assert _is_manual(_post().json()) and len(rn["calls"]) == 1
     assert _db.identify_receipts.find_one({})["ai_tried"] is True
     r = _post()
@@ -1676,3 +1684,62 @@ def test_fallback_flag_default_off(monkeypatch):
     assert _vis._fallback_widened() is True
     monkeypatch.setenv("VISION_FALLBACK_ON_MANUAL", "0")
     assert _vis._fallback_widened() is False
+
+
+# ── Revisión final C2: barrera del recibo ANTES de la IA + resolve_hint ─────
+
+
+def test_gate_split_receipt_only_and_read_only():
+    mx = get_settings().ai_catalog_max_top_score
+    assert aic.gate_receipt({"top_score": 0.2, "twins": True}) == "visual_candidate"
+    assert aic.gate_receipt({"top_score": mx}) == "visual_candidate"
+    assert aic.gate_receipt({"top_score": mx - 0.01}) is None
+    assert aic.gate_receipt({"top_score": "x"}) is None and aic.gate_receipt(None) is None
+    assert aic.gate_read(None) == "no_diecast"
+    assert aic.gate_read(_read(confidence="medio")) == "low_confidence"
+    assert aic.gate_read(_read(casting=" ")) == "missing_identity"
+    assert aic.gate_read(_read()) is None
+
+
+def test_twins_or_high_receipt_makes_zero_ai_calls(rn, caplog):
+    mx = get_settings().ai_catalog_max_top_score
+    _receipt(twins=True)
+    with caplog.at_level(_logging.INFO, logger=idn._log.name):
+        r = _post()
+    assert r.status_code == 200 and _is_manual(r.json())
+    assert rn["calls"] == [] and _rows() == 0
+    assert "ai_catalog rejected:visual_candidate user=u1" in caplog.text
+    _db.identify_receipts.delete_many({})
+    _receipt(top=mx)
+    assert _is_manual(_post().json()) and rn["calls"] == []
+
+
+@pytest.mark.parametrize("top,twins,hint", [(0.4, False, True), (0.4, True, False), (0.99, False, False)])
+def test_identify_resolve_hint_follows_receipt_gate(monkeypatch, top, twins, hint):
+    monkeypatch.setattr(idn, "_run_identify", _fake(manual=True, top=top, twins=twins))
+    out = _go()
+    assert out.debug["resolve_hint"] is hint
+    assert _db.identify_receipts.count_documents({}) == 1
+
+
+def test_identify_resolve_hint_false_when_off_matched_or_unwritten(monkeypatch):
+    monkeypatch.setattr(get_settings(), "ai_catalog_enabled", False)
+    monkeypatch.setattr(idn, "_run_identify", _fake(manual=True, top=0.3))
+    assert _go().debug["resolve_hint"] is False
+    monkeypatch.setattr(get_settings(), "ai_catalog_enabled", True)
+    monkeypatch.setattr(idn, "_run_identify", _fake(manual=False, item={"id": "x"}))
+    assert _go().debug["resolve_hint"] is False
+    monkeypatch.setattr(idn, "_run_identify", _fake(manual=True, top=0.3))
+    monkeypatch.setattr(idn, "write_receipt", lambda *a, **k: False)
+    assert _go().debug["resolve_hint"] is False
+
+
+def test_identify_resolve_hint_on_base64_route(monkeypatch):
+    who = {"id": "u1"}
+    _api.dependency_overrides[_gcu] = lambda: CurrentUser({"id": who["id"], "username": who["id"]})
+    try:
+        monkeypatch.setattr(idn, "_run_identify", _fake(manual=True, top=0.3))
+        r = _client.post("/api/v1/identify/base64", json={"image_base64": _b64.b64encode(IMG).decode()})
+        assert r.status_code == 200 and r.json()["debug"]["resolve_hint"] is True
+    finally:
+        _api.dependency_overrides.clear()
