@@ -891,6 +891,17 @@ def rn(aienv, monkeypatch):
         return dict(r) if r else r
 
     monkeypatch.setattr(cv, "read_for_catalog", fake_read)
+
+    def fake_verify(data, *a, **k):
+        # Por defecto, un verificador que ve lo mismo que la lectura (sin
+        # verificador ya no se crea nada: P2).
+        state["verify_calls"] = state.get("verify_calls", 0) + 1
+        r = state["read"] if isinstance(state["read"], dict) else {}
+        return {"fisico": True, "texto_leido": str(r.get("texto") or ""), "marca_leido": "",
+                "casting_leido": str(r.get("casting") or ""), "year_leido": r.get("year"),
+                "detalle": "ok"}
+
+    monkeypatch.setattr(cv, "verify_real_object", fake_verify)
     yield state
     _api.dependency_overrides.clear()
 
@@ -2543,3 +2554,36 @@ def test_p5_usage_unique_index_matches_upsert_key():
     assert doc["count"] == 2 and doc["ai_calls"] == 1
     assert _db.ai_catalog_usage.count_documents({"user_id": aic.GLOBAL_USAGE_ID}) == 1
     _db.ai_catalog_usage.delete_many({})
+
+
+# P2: verificador que falla = no se crea (ni con lectura «alto»).
+
+
+@pytest.mark.parametrize("verify", [lambda *a, **k: None,
+                                    lambda *a, **k: (_ for _ in ()).throw(RuntimeError("down"))])
+def test_p2_verifier_down_never_creates_and_keeps_receipt_retryable(rn, aienv, monkeypatch, verify):
+    rn["read"] = _fp_read(texto="MOON EQUIPMENT CO., PANDEM")  # «alto», pasa gate_create
+    monkeypatch.setattr(cv, "verify_real_object", verify)
+    _db.ai_catalog_usage.delete_many({})
+    _receipt()
+    j = _post().json()
+    assert _is_manual(j)
+    assert _db.variants.count_documents({}) == 0 and _db.items.count_documents({}) == 0
+    assert list(_upl.UPLOAD_DIR.iterdir()) == []  # ni imagen
+    assert aienv["appends"] == []  # ni índice
+    usage = _db.ai_catalog_usage.find_one({"user_id": "u1"})
+    assert not usage.get("count")  # tope de altas intacto
+    assert usage["ai_calls"] == 2  # lectura y verificación sí cuentan (pagadas)
+    rec = _db.identify_receipts.find_one({})
+    assert rec is not None and not rec.get("ai_tried")  # se puede reintentar
+
+
+def test_p2_retry_after_verifier_failure_can_create(rn, monkeypatch):
+    rn["read"] = _fp_read(texto="MOON EQUIPMENT CO., PANDEM")
+    monkeypatch.setattr(cv, "verify_real_object", lambda *a, **k: None)
+    _receipt()
+    assert _is_manual(_post().json())
+    monkeypatch.setattr(cv, "verify_real_object", lambda *a, **k: {
+        "fisico": True, "texto_leido": "MOON EQUIPMENT CO. PANDEM", "casting_leido": "AlphaTauri F1",
+        "year_leido": None, "detalle": "ok"})
+    assert _post().json()["method"] == "o"

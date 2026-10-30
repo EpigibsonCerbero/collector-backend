@@ -1154,6 +1154,11 @@ _RESOLVE_READ_TIMEOUT_S = 8.0
 _RESOLVE_VERIFY_TIMEOUT_S = 5.0
 _RESOLVE_BUDGET_S = 11.0
 
+# Rechazo por verificador ausente: fallo transitorio, el recibo no se marca
+# `ai_tried` (un reintento puede crear). La lectura sí quedó contada.
+_NO_VERIFIER = "rejected:no_verifier"
+_RETRYABLE = frozenset({_NO_VERIFIER})
+
 
 def _read_and_gate(
     data: bytes,
@@ -1204,13 +1209,16 @@ def _read_and_gate(
     except Exception:  # noqa: BLE001
         verdict = None
     if verdict is None:
-        # Fail-open solo si la lectura ya era «alto»; con rescate pendiente, sin
-        # verificador no hay creación.
-        if needs_rescue:
-            print(f"[ai-catalog] rechazo {reason} (sin verificador)", flush=True)
-            return f"rejected:{reason}", read
-    elif verdict.get("fisico") is not True:
-        print(f"[ai-catalog] rechazo not_foto_real ({verdict.get('detalle')})", flush=True)
+        # Sin segunda opinión (error, timeout, corte abierto, sin clave) NO se
+        # crea, ni con lectura «alto». Fallo transitorio: el recibo no se marca.
+        print("[ai-catalog] rechazo no_verifier (sin verificador)", flush=True)
+        return _NO_VERIFIER, read
+    if verdict.get("fisico") is not True:
+        print(
+            f"[ai-catalog] rechazo not_foto_real (fisico={verdict.get('fisico')!r} "
+            f"detalle_len={len(verdict.get('detalle') or '')})",
+            flush=True,
+        )
         return "rejected:not_foto_real", read
     else:
         quoted = verdict.get("texto_leido") or ""
@@ -1362,7 +1370,7 @@ async def identify_resolve_new(
     piece = None
     if decision is None:
         decision, piece = await _create_piece(db, uid, read, data, receipt)
-    if read is not None and piece is None:
+    if read is not None and piece is None and decision not in _RETRYABLE:
         await asyncio.to_thread(_mark_ai_tried, db, receipt)
     _log.info("ai_catalog %s user=%s", decision, uid)
     if piece is None:
