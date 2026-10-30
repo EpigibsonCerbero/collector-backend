@@ -1184,7 +1184,7 @@ def match_embedding(emb: np.ndarray, top_k: int = 8, include_mv: bool = False) -
 
 
 def search_catalog_by_text(
-    ocr_text: str, top_k: int = 8, budget_s: float = 2.0
+    ocr_text: str, top_k: int = 8, budget_s: float = 2.0, stats: dict | None = None
 ) -> list[VisionMatch]:
     """Búsqueda textual en TODO el catálogo por tokens del OCR.
 
@@ -1198,8 +1198,13 @@ def search_catalog_by_text(
     `budget_s` es un TECHO duro de tiempo: sobre 27k nombres el scorer difusivo
     se disparaba a 26-90 s con OCR largo (imágenes IA). Con presupuesto agotado
     devolvemos lo que llevamos acumulado — peor es colgar el request.
+
+    `stats` (opcional): si se pasa, `stats["truncated"]` queda True cuando el
+    presupuesto cortó el recorrido del catálogo (resultado parcial).
     """
     t_start = time.time()
+    if stats is not None:
+        stats["truncated"] = False
     text = (ocr_text or "").lower()
     if len(text.strip()) < 4:
         return []
@@ -1215,6 +1220,8 @@ def search_catalog_by_text(
     cheap: list[tuple[VisionMatch, float]] = []
     for e in index:
         if time.time() - t_start > budget_s:
+            if stats is not None:
+                stats["truncated"] = True
             break
         name = e.get("name") or ""
         if not name:

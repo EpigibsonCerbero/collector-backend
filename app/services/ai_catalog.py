@@ -6,7 +6,9 @@ El catálogo es COMPARTIDO: un alta errónea la ven todos. Por eso las barreras
 `app.routers.identify` (el identify lo importa a él).
 
 Uso previsto (Task 5): `gate` → `daily_cap_reached` → `create_from_read` →
-`consume_daily` si `created` → `strip_internal` antes de responder a la app.
+según `outcome`: "created" (`consume_daily` y responder), "duplicate"
+(responder con la existente) o "uncertain" (no se creó nada: flujo manual).
+`strip_internal` antes de responder a la app.
 """
 from __future__ import annotations
 
@@ -15,7 +17,9 @@ import io
 import logging
 import re
 import unicodedata
+import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 import numpy as np
@@ -29,19 +33,46 @@ _log = logging.getLogger(__name__)
 _NS = uuid.UUID("a9f73cdf-180a-5bd7-ac02-42c291653666")
 
 # Slugs de marca iguales a los de los scrapers (scripts/gen_diecast_extra_catalog.py,
-# scrape_minigt_catalog.py). Clave: nombre de marca sin espacios ni signos.
-_BRAND_SLUGS = {
-    "minigt": "minigt",
-    "inno64": "inno64",
-    "tarmacworks": "tarmac-works",
-    "kaidohouse": "kaidohouse",
-    "poprace": "pop-race",
-    "tomica": "tomica",
-    "hotwheels": "hw",
+# scrape_minigt_catalog.py). Se busca la raíz dentro del nombre compacto, así
+# «TSM Mini GT», «MiniGT» y «Mini GT» caen en el mismo slug.
+_BRAND_ALIASES = (
+    ("minigt", "minigt"),
+    ("hotwheels", "hw"),
+    ("inno64", "inno64"),
+    ("tarmac", "tarmac-works"),
+    ("kaido", "kaidohouse"),
+    ("poprace", "pop-race"),
+    ("tomica", "tomica"),
+)
+
+# Solo Mini GT tiene un número de pieza único y validable (MGT + 5 dígitos).
+# En el resto de marcas el número leído es metadato, nunca identidad.
+_TOY_ID_BRANDS = {"minigt"}
+
+# Campos internos de moderación/resultado: nunca salen hacia la app.
+_INTERNAL = (
+    "origin", "verified", "source_confidence", "confirmed_by", "created_by", "hidden",
+    "created", "outcome", "reason",
+)
+
+# Presupuesto de la búsqueda textual anti-duplicado. Corre fuera del identify
+# (no cuenta contra sus 8 s); si aun así se agota, el resultado es «incierto».
+DUP_TEXT_BUDGET_S = 6.0
+
+# Colores base (es/en) → canónico, para comparar lecturas con el catálogo.
+_COLORS = {
+    "azul": "blue", "blue": "blue", "rojo": "red", "red": "red", "negro": "black",
+    "black": "black", "blanco": "white", "white": "white", "plata": "silver",
+    "plateado": "silver", "silver": "silver", "gris": "grey", "grey": "grey",
+    "gray": "grey", "verde": "green", "green": "green", "amarillo": "yellow",
+    "yellow": "yellow", "naranja": "orange", "orange": "orange", "morado": "purple",
+    "purpura": "purple", "purple": "purple", "violeta": "purple", "rosa": "pink",
+    "pink": "pink", "cafe": "brown", "marron": "brown", "brown": "brown",
+    "dorado": "gold", "oro": "gold", "gold": "gold", "turquesa": "teal", "teal": "teal",
 }
 
-# Campos internos de moderación: nunca salen hacia la app.
-_INTERNAL = ("origin", "verified", "source_confidence", "confirmed_by", "created_by", "hidden", "created")
+# Cobertura mínima entre las descripciones de livery para darlas por iguales.
+_LIVERY_MATCH = 0.6
 
 _YEAR_MIN = 1950
 
@@ -66,19 +97,29 @@ def normalize_key(brand, casting, color, dorsal, livery) -> str:
 
 def _brand_slug(brand) -> str:
     compact = _fold(brand).replace(" ", "")
-    return _BRAND_SLUGS.get(compact, "-".join(_fold(brand).split()) or "unknown")
+    for root, slug in _BRAND_ALIASES:
+        if root in compact:
+            return slug
+    return "-".join(_fold(brand).split()) or "unknown"
+
+
+def _raw_toy(read: dict) -> str | None:
+    raw = re.sub(r"\s+", "", str(read.get("toy_number") or "")).upper().lstrip("▶>")
+    return raw or None
 
 
 def _norm_toy(read: dict) -> str | None:
-    raw = re.sub(r"\s+", "", str(read.get("toy_number") or "")).upper()
-    raw = raw.lstrip("▶>")
-    if not raw:
+    """Número de pieza con valor de IDENTIDAD, o None.
+
+    Solo Mini GT con forma validable (MGT00692, ▶692, 692). Cualquier otra
+    marca o forma → None (se guarda aparte como metadato)."""
+    raw = _raw_toy(read)
+    if not raw or _brand_slug(read.get("brand")) not in _TOY_ID_BRANDS:
         return None
-    if _brand_slug(read.get("brand")) == "minigt":
-        m = re.fullmatch(r"(?:MGT)?0*(\d{1,5})", raw)
-        if m:
-            return f"MGT{int(m.group(1)):05d}"
-    return raw
+    m = re.fullmatch(r"(?:MGT)?0*(\d{1,5})", raw)
+    if not m or int(m.group(1)) == 0:
+        return None
+    return f"MGT{int(m.group(1)):05d}"
 
 
 def make_source_id(read: dict) -> str:
@@ -86,8 +127,10 @@ def make_source_id(read: dict) -> str:
     toy = _norm_toy(read)
     if toy:
         return f"{slug}-{toy}"
-    key = normalize_key(read.get("brand"), read.get("casting"), read.get("color"),
-                        read.get("dorsal"), read.get("livery"))
+    # Con livery, el color no entra en la clave (la IA lo redacta a su manera).
+    livery = read.get("livery")
+    key = normalize_key(_brand_slug(read.get("brand")), read.get("casting"),
+                        None if livery else read.get("color"), read.get("dorsal"), livery)
     return f"ai-{slug}-{hashlib.sha1(key.encode('utf-8')).hexdigest()[:12]}"
 
 
@@ -151,46 +194,186 @@ def _resolve_variant(db, vid) -> dict | None:
     return None
 
 
-def find_duplicate(db, read: dict, crop_vec: list[float] | None) -> dict | None:
-    """Pieza ya presente en el catálogo (o None). Conservador: ante la duda, existe.
+@dataclass
+class DupCheck:
+    """Resultado de la comprobación anti-duplicado.
 
-    Orden: id determinista → toy# legible → texto (marca+casting+livery/color)
-    → embedding del recorte contra el índice completo (vistas aisladas incluidas).
+    outcome: "duplicate" (piece = la existente), "uncertain" (no crear) o
+    "new" (se puede crear). `reason` explica el porqué."""
+
+    outcome: str
+    reason: str
+    piece: dict | None = None
+
+
+def _casting_toks(read_or_casting, brand=None) -> set[str]:
+    if isinstance(read_or_casting, dict):
+        r = read_or_casting
+        toks = _toks(r.get("casting"), r.get("modelo"))
+        brand = r.get("brand")
+    else:
+        toks = _toks(read_or_casting)
+    return toks - _toks(brand) - {"tsm"}
+
+
+def _casting_match(a: set[str], b: set[str]) -> bool:
+    """Mismo casting: uno contiene al otro, o casi todo coincide y los tokens
+    con dígitos (R33/R34, 911/930) son idénticos."""
+    if not a or not b:
+        return False
+    if a <= b or b <= a:
+        return True
+    da = {t for t in a if any(c.isdigit() for c in t)}
+    db_ = {t for t in b if any(c.isdigit() for c in t)}
+    return da == db_ and len(a & b) / min(len(a), len(b)) >= 0.8
+
+
+def _colors(*parts) -> set[str]:
+    return {_COLORS[t] for t in _toks(*parts) if t in _COLORS}
+
+
+def _dorsal(v) -> str | None:
+    d = re.sub(r"\D+", "", str(v or ""))
+    return d.lstrip("0") or (d and "0") or None
+
+
+def _livery_verdict(read: dict, doc: dict) -> str:
+    """"match" | "conflict" | "ambiguous" entre la lectura y una variante del
+    mismo casting. Solo "match" con evidencia fuerte; la duda es "ambiguous".
+
+    El livery se compara sin palabras de color (la IA dice «azul», el scrape
+    «Blue»); el color va aparte, canonizado es/en."""
+    rd, dd = _dorsal(read.get("dorsal")), _dorsal(doc.get("livery_number"))
+    if rd and dd and rd != dd:
+        return "conflict"
+    rl = _toks(read.get("livery"))
+    if doc.get("livery_desc"):
+        dl = _toks(doc.get("livery_desc"))
+    elif doc.get("origin") != "ai":
+        dl = _toks(doc.get("variant_name"))  # en el scrape, variant_name = livery
+    else:
+        dl = set()  # pieza IA sin livery: su variant_name es color o casting
+    rc = _colors(read.get("color"), read.get("livery"))
+    dc = _colors(doc.get("body_color"), doc.get("livery_color"), " ".join(dl))
+    color_conflict = bool(rc and dc and not (rc & dc))
+    if color_conflict:
+        return "conflict"
+    rcore = {t for t in rl if t not in _COLORS}
+    dcore = {t for t in dl if t not in _COLORS}
+    if rcore and dcore:
+        inter = rcore & dcore
+        if inter and len(inter) / min(len(rcore), len(dcore)) >= _LIVERY_MATCH:
+            return "match"
+        if not inter and not (rc and dc):
+            return "conflict"  # nombres de livery distintos y sin color que los acerque
+        return "ambiguous"
+    if not rl and not dl and rc and dc and rd == dd:
+        return "match"  # ninguna trae livery, los colores y el dorsal coinciden
+    return "ambiguous"
+
+
+def _same_casting_variants(db, read: dict, limit: int = 500) -> list[dict]:
+    """Variantes de la MISMA marca cuyo casting coincide con la lectura."""
+    slug = _brand_slug(read.get("brand"))
+    ct = _casting_toks(read)
+    if not ct:
+        return []
+    anchor = max(sorted(ct), key=len)  # determinista
+    rx = {"$regex": re.escape(anchor), "$options": "i"}
+    mids = []
+    for m in db.items.find({"$or": [{"name": rx}, {"casting_name": rx}]}).limit(limit):
+        if _brand_slug(m.get("manufacturer")) != slug:
+            continue
+        mt = _casting_toks(m.get("casting_name") or m.get("name"), m.get("manufacturer"))
+        if _casting_match(ct, mt):
+            mids.append(str(m["_id"]))
+    if not mids:
+        return []
+    return list(db.variants.find({"item_master_id": {"$in": mids}}).limit(limit))
+
+
+def check_duplicate(db, read: dict, crop_vec: list[float] | None) -> DupCheck:
+    """Tres salidas: duplicate / uncertain / new. Ante la duda, NO crear.
+
+    Orden: id determinista → toy# Mini GT (con marca y casting de acuerdo) →
+    variantes de la misma marca y casting (livery/dorsal/color) → texto →
+    embedding del recorte contra el índice completo (vistas aisladas incluidas).
     Los fallos del índice se propagan: sin poder comprobar, no se crea."""
     st = get_settings()
+
+    def dup(doc: dict, reason: str) -> DupCheck:
+        return DupCheck("duplicate", reason, _piece_out(doc, _load_master(db, doc), created=False))
+
     doc = _resolve_variant(db, piece_id(make_source_id(read)))
-    if doc is None:
-        # Los ids del scrape no salen del toy# (Mini GT: `minigt-<id del sitio>`),
-        # así que el toy# legible se busca también como campo.
-        toy = _norm_toy(read)
-        if toy:
-            doc = db.variants.find_one({"toy_number": toy})
-    if doc is None:
-        doc = _dup_by_text(db, read, st.ai_catalog_dup_text_overlap)
-    if doc is None and crop_vec is not None:
+    if doc is not None:
+        return dup(doc, "same_id")
+
+    slug = _brand_slug(read.get("brand"))
+    ct = _casting_toks(read)
+    toy = _norm_toy(read)
+    if toy:
+        # Los ids del scrape no salen del toy# (`minigt-<id del sitio>`): se busca
+        # como campo, pero solo vale si la marca y el casting impresos coinciden.
+        hits = list(db.variants.find({"toy_number": toy}).limit(20))
+        for h in hits:
+            m = _load_master(db, h) or {}
+            if _brand_slug(m.get("manufacturer")) == slug and _casting_match(
+                ct, _casting_toks(m.get("casting_name") or m.get("name"), m.get("manufacturer"))
+            ):
+                return dup(h, "same_toy")
+        if hits:
+            return DupCheck("uncertain", "toy_name_mismatch")
+
+    verdicts = [(_livery_verdict(read, v), v) for v in _same_casting_variants(db, read)]
+    for verdict, v in verdicts:
+        if verdict == "match":
+            return dup(v, "same_casting_livery")
+    if any(verdict == "ambiguous" for verdict, _ in verdicts):
+        return DupCheck("uncertain", "same_casting_ambiguous")
+
+    doc, truncated = _dup_by_text(db, read, st.ai_catalog_dup_text_overlap)
+    if doc is not None:
+        return dup(doc, "text")
+    if truncated:
+        return DupCheck("uncertain", "text_search_truncated")
+
+    if crop_vec is not None:
         from app.services import vision
 
         hits = vision.match_embedding(np.asarray(crop_vec, dtype=np.float32), top_k=3, include_mv=True)
-        if hits and hits[0].score >= st.ai_catalog_dup_embed_score:
-            doc = _resolve_variant(db, hits[0].id)
-    if doc is None:
-        return None
-    return _piece_out(doc, _load_master(db, doc), created=False)
+        for h in hits:
+            if h.score < st.ai_catalog_dup_embed_score:
+                break
+            doc = _resolve_variant(db, h.id)
+            if doc is not None:
+                return dup(doc, "embedding")
+    return DupCheck("new", "no_match")
 
 
-def _dup_by_text(db, read: dict, threshold: float) -> dict | None:
-    """Candidatos de `vision.search_catalog_by_text`, aceptados solo si casi
-    todo su nombre está en la lectura (cobertura ≥ umbral) y comparten un
-    token del casting. Un livery gemelo («Midnight Purple» frente a «Bayside
-    Blue») no llega al umbral."""
+def find_duplicate(db, read: dict, crop_vec: list[float] | None) -> dict | None:
+    """Pieza existente o None. OJO: None NO significa «se puede crear» (puede
+    ser incierto); para decidir el alta usar `check_duplicate`."""
+    return check_duplicate(db, read, crop_vec).piece
+
+
+def _dup_by_text(db, read: dict, threshold: float) -> tuple[dict | None, bool]:
+    """(variante, truncada). Candidatos de `vision.search_catalog_by_text`,
+    aceptados solo si casi todo su nombre está en la lectura (cobertura ≥
+    umbral) y comparten un token del casting. Un livery gemelo («Midnight
+    Purple» frente a «Bayside Blue») no llega al umbral. `truncada` = la
+    búsqueda agotó su presupuesto (resultado parcial, no concluyente)."""
     from app.services import vision
 
     brand, casting = read.get("brand"), read.get("casting")
     livery = read.get("livery") or read.get("color")
     query = " ".join(str(p) for p in (brand, casting, read.get("modelo"), livery, read.get("dorsal")) if p)
     read_toks = _toks(brand, casting, read.get("modelo"), read.get("livery"), read.get("color"), read.get("dorsal"))
-    cast_toks = _toks(casting, read.get("modelo")) - _toks(brand)
-    for m in vision.search_catalog_by_text(query, top_k=5):
+    cast_toks = _casting_toks(read)
+    stats: dict = {}
+    t0 = _clock()
+    cands = vision.search_catalog_by_text(query, top_k=5, budget_s=DUP_TEXT_BUDGET_S, stats=stats)
+    truncated = bool(stats.get("truncated")) or (_clock() - t0) >= DUP_TEXT_BUDGET_S
+    for m in cands:
         name_toks = _toks(m.name)
         if len(name_toks) < 2 or not (name_toks & cast_toks):
             continue
@@ -198,8 +381,12 @@ def _dup_by_text(db, read: dict, threshold: float) -> dict | None:
         if cover >= threshold:
             doc = _resolve_variant(db, m.id)
             if doc:
-                return doc
-    return None
+                return doc, truncated
+    return None, truncated
+
+
+def _clock() -> float:
+    return time.monotonic()
 
 
 # ── Tope diario ────────────────────────────────────────────────────────────
@@ -274,9 +461,13 @@ def create_from_read(db, user_id: str, read: dict, image_bytes: bytes) -> dict:
     crop = seg.image if seg is not None else None
     crop_vec = dinov2_embed.embed_image(crop) if crop is not None else None
 
-    dup = find_duplicate(db, read, crop_vec)
-    if dup is not None:
-        return dup
+    chk = check_duplicate(db, read, crop_vec)
+    if chk.outcome == "duplicate":
+        return {**chk.piece, "outcome": "duplicate", "reason": chk.reason}
+    if chk.outcome == "uncertain":
+        # No se escribe nada (ni imagen, ni Mongo, ni índice): el llamador
+        # devuelve el flujo manual.
+        return {"outcome": "uncertain", "reason": chk.reason, "created": False}
 
     brand = _clean(read.get("brand"))
     casting = _clean(read.get("casting"))
@@ -295,6 +486,9 @@ def create_from_read(db, user_id: str, read: dict, image_bytes: bytes) -> dict:
         metadata["year"] = year
     if series:
         metadata["series"] = series
+    raw_toy = _raw_toy(read)
+    if raw_toy and not toy:
+        metadata["toy_number"] = raw_toy  # número leído sin valor de identidad
 
     variant = {
         "id": vid,
@@ -333,7 +527,10 @@ def create_from_read(db, user_id: str, read: dict, image_bytes: bytes) -> dict:
             _append_live({"id": vid, "toy": toy, "name": name, "view": 0}, full_vec)
         if crop_vec is not None:
             _append_live({"id": vid, "toy": toy, "name": name, "view": 20}, crop_vec)
-    return _piece_out(doc, master_doc, created=created)
+    out = _piece_out(doc, master_doc, created=created)
+    out["outcome"] = "created" if created else "duplicate"
+    out["reason"] = "created" if created else "race"
+    return out
 
 
 def strip_internal(doc: dict) -> dict:
