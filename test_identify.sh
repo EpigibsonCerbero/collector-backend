@@ -2,12 +2,14 @@
 # Prueba el endpoint /identify con una o varias imágenes.
 #   ./test_identify.sh /tmp/mgt00726.jpg ~/Fotos/gemini.jpg
 API="http://192.168.100.24:8000/api/v1/identify"
+TOKEN="${TOKEN:-}"
+[ -n "$TOKEN" ] || { echo "El identify exige sesión. Uso: TOKEN=<access_token> $0 <imagen> [imagen...]"; exit 1; }
 [ $# -eq 0 ] && { echo "Uso: $0 <imagen> [imagen...]"; exit 1; }
 for img in "$@"; do
   [ -f "$img" ] || { echo "— no existe: $img"; continue; }
   echo "════════════════════════════════════════"
   echo "📷 $img"
-  curl -s -m 60 -X POST "$API" -F "image=@$img" | python3 -c "
+  curl -s -m 60 -X POST "$API" -H "Authorization: Bearer ${TOKEN}" -F "image=@$img" | python3 -c "
 import json,sys
 d=json.load(sys.stdin)
 print('  method  :', d['method'], '| needs_manual:', d['needs_manual'], '| conf:', round(d['confidence'],3))

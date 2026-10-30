@@ -168,6 +168,8 @@
   .brandbar label{font-size:11px; letter-spacing:1.6px; text-transform:uppercase; color:var(--muted); font-weight:600}
   .brandbar select{font-family:inherit; background:var(--bg2); color:var(--txt); border:1px solid var(--line2); border-radius:10px; padding:10px 13px; font-size:13px; min-width:200px; cursor:pointer}
   .brandbar select:focus{outline:none; border-color:var(--red)}
+  .brandbar input{font-family:inherit; background:var(--bg2); color:var(--txt); border:1px solid var(--line2); border-radius:10px; padding:10px 13px; font-size:13px; min-width:200px; flex:1; max-width:420px}
+  .brandbar input:focus{outline:none; border-color:var(--red)}
   .brandbar .hint{font-size:11px; color:var(--muted); flex:1; min-width:180px}
 
   .empty-state{color:#4A4F5A; text-align:center; padding:30px 16px; font-size:12.5px; letter-spacing:.4px}
@@ -215,6 +217,13 @@
       <option value="Pop Race">Pop Race</option>
     </select>
     <span class="hint">Opcional. Si la dices, el matching aprieta el prior de marca (+0.20 / ×0.45). Cada marca trae su código: <b>MGT#####</b> y dorsal <b>#NN</b> en Mini GT · <b>UPC/SKU</b> en Hot Wheels · <b>JAN</b> en Tomica.</span>
+  </div>
+
+  <!-- ══ TOKEN DE ACCESO ══ -->
+  <div class="brandbar">
+    <label for="token">Token de acceso</label>
+    <input id="token" type="password" autocomplete="off" spellcheck="false" placeholder="Pega aquí tu access_token" />
+    <span class="hint">El identify exige sesión. Se guarda solo en esta pestaña (sessionStorage).</span>
   </div>
 
   <!-- ══ CONSEJOS DE FOTO ══ -->
@@ -392,6 +401,11 @@
     statusEl.className = 'status show ' + kind;
     statusEl.textContent = msg;
   }
+  const tokenEl = $('token');
+  try { tokenEl.value = sessionStorage.getItem('lab_token') || ''; } catch (e) {}
+  tokenEl.addEventListener('input', () => {
+    try { sessionStorage.setItem('lab_token', tokenEl.value.trim()); } catch (e) {}
+  });
   function hideStatus() { statusEl.className = 'status'; }
 
   // ── File intake ──
@@ -470,11 +484,19 @@
         clientLog(`marca declarada por ti: ${brandVal} (prior endurecido)`);
       }
 
-      const res = await fetch('/api/v1/identify', { method: 'POST', body: fd });
+      const tok = tokenEl.value.trim();
+      const res = await fetch('/api/v1/identify', {
+        method: 'POST',
+        body: fd,
+        headers: tok ? { 'Authorization': 'Bearer ' + tok } : {},
+      });
       const raw = await res.text();
       const wall = Math.round(performance.now() - t0);
       clientLog(`respuesta HTTP ${res.status} · ${raw.length} bytes · ${wall} ms wall-clock`, !res.ok);
 
+      if (res.status === 401) {
+        throw new Error('Se necesita un token de acceso: pégalo arriba.');
+      }
       if (!res.ok) {
         throw new Error(`HTTP ${res.status} · ${raw.slice(0, 300)}`);
       }
