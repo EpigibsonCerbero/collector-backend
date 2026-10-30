@@ -17,9 +17,11 @@ from datetime import datetime, timezone
 
 
 def list_pending(db, limit: int = 100) -> list[dict]:
-    """Piezas de IA sin verificar y no ocultas, más recientes primero."""
+    """TODAS las piezas de IA no ocultas (verificadas incluidas, con su marca),
+    más recientes primero: una cuenta alterna que confirma una pieza basura no
+    la saca de la revisión."""
     cur = (
-        db.variants.find({"origin": "ai", "verified": False, "hidden": {"$ne": True}})
+        db.variants.find({"origin": "ai", "hidden": {"$ne": True}})
         .sort("created_at", -1)
         .limit(int(limit))
     )
@@ -34,6 +36,7 @@ def list_pending(db, limit: int = 100) -> list[dict]:
                 "created_at": d.get("created_at"),
                 "source_confidence": d.get("source_confidence"),
                 "confirmed_by": len(d.get("confirmed_by") or []),
+                "verified": bool(d.get("verified")),
             }
         )
     return rows
@@ -91,7 +94,7 @@ def _fmt(v) -> str:
 
 
 def _print_table(rows: list[dict]) -> None:
-    cols = ["id", "name", "brand", "created_by", "created_at", "source_confidence", "confirmed_by"]
+    cols = ["id", "name", "brand", "created_by", "created_at", "source_confidence", "confirmed_by", "verified"]
     if not rows:
         print("Sin piezas pendientes.")
         return

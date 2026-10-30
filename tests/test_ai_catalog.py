@@ -1404,8 +1404,11 @@ def test_list_pending_filters_and_orders(hid):
     _p7("hid", 30, hidden=True)
     _db.variants.insert_one({"_id": "scrape", "variant_name": "x"})
     rows = rev.list_pending(_db)
-    assert [r["id"] for r in rows] == ["new", "old"]
-    assert rows[1]["confirmed_by"] == 1 and rows[1]["created_by"] == "u1"
+    # Las verificadas también salen (una cuenta alterna no puede esconder una
+    # pieza confirmándola): todas las de IA no ocultas, recientes primero.
+    assert [r["id"] for r in rows] == ["ver", "new", "old"]
+    assert [r["verified"] for r in rows] == [True, False, False]
+    assert rows[2]["confirmed_by"] == 1 and rows[2]["created_by"] == "u1"
     assert {"name", "brand", "created_at", "source_confidence"} <= set(rows[0])
     assert len(rev.list_pending(_db, limit=1)) == 1
 
@@ -1441,8 +1444,12 @@ def test_demote_refuses_non_ai_piece(hid, capsys):
 
 def test_cli_prints_table(hid, capsys):
     _p7("a1")
+    _p7("a2", 5, verified=True)
     assert rev.main([], db=_db) == 0
-    assert "a1" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "a1" in out and "a2" in out and "verified" in out.splitlines()[0]
+    line = next(x for x in out.splitlines() if x.startswith("a2"))
+    assert "True" in line
 
 
 def test_catalog_hides_hidden_but_lookup_by_id_works(hid):
