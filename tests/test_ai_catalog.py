@@ -2924,3 +2924,26 @@ def test_p3_vision_warmup_loads_yolo_only_when_ai_catalog_on(monkeypatch, enable
     monkeypatch.setattr(_yolo, "warmup", lambda: calls.append(1))
     _vis._warmup_yolo()
     assert calls == ([1] if enabled else [])
+
+
+# P7: los logs tocados no llevan texto crudo del modelo ni del proveedor.
+
+
+def test_p7_retry_log_has_no_provider_body(style, capsys):
+    _calls, queue, _clock = style
+    secret = "SECRET-PROVIDER-TEXT"
+    queue += [_Resp(400, {"error": {"type": "invalid_request_error",
+                                    "message": f"thinking not supported {secret}"}}), _ok({"titulo": "a"})]
+    _gen(b"p7-1")
+    out = capsys.readouterr().out
+    assert "reintento" in out and secret not in out
+
+
+def test_p7_not_foto_real_log_has_no_detalle(rn, monkeypatch, capsys):
+    rn["read"] = _fp_read(texto="MOON EQUIPMENT CO., PANDEM")
+    monkeypatch.setattr(cv, "verify_real_object", lambda *a, **k: {
+        "fisico": False, "texto_leido": "", "detalle": "MODEL-RAW-DETAIL"})
+    _receipt()
+    _post()
+    out = capsys.readouterr().out
+    assert "not_foto_real" in out and "MODEL-RAW-DETAIL" not in out and "detalle_len=16" in out
