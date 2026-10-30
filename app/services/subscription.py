@@ -117,17 +117,22 @@ def reserve_scan(db, user_id: str) -> tuple[bool, int]:
         return True, int(usage.get("count", 0))
     limit = st.free_daily_scans
     day = today_key()
-    try:
-        doc = db.scan_usage.find_one_and_update(
-            {"user_id": user_id, "day": day, "count": {"$lt": limit}},
-            {"$inc": {"count": 1}, "$setOnInsert": {"created_at": datetime.now(timezone.utc)}},
-            upsert=True,
-            return_document=ReturnDocument.AFTER,
-        )
-    except DuplicateKeyError:
-        # El documento del día existe y ya no cumple count < limit: tope alcanzado.
-        return False, limit
-    return True, int(doc["count"])
+    for _ in range(3):
+        try:
+            doc = db.scan_usage.find_one_and_update(
+                {"user_id": user_id, "day": day, "count": {"$lt": limit}},
+                {"$inc": {"count": 1}, "$setOnInsert": {"created_at": datetime.now(timezone.utc)}},
+                upsert=True,
+                return_document=ReturnDocument.AFTER,
+            )
+            return True, int(doc["count"])
+        except DuplicateKeyError:
+            # El documento del día ya existe: o llegó al tope, o es la carrera del
+            # primer escaneo (otra petición lo creó entre el filtro y el upsert).
+            cur = db.scan_usage.find_one({"user_id": user_id, "day": day}) or {}
+            if int(cur.get("count", 0)) >= limit:
+                return False, limit
+    return False, limit
 
 
 def release_scan(db, user_id: str) -> None:

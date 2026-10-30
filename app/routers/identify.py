@@ -10,16 +10,22 @@ from __future__ import annotations
 import asyncio
 import base64
 import re
+import threading
+import time
 import unicodedata
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import JSONResponse
 
 from app.ratelimit import client_ip, hit_or_429
 from app.security import CurrentUser, get_current_user
 from pydantic import BaseModel, Field
 
+from app.config import get_settings
 from app.db import as_id, get_db, oid, serialize, serialize_many
+from app.services import revenuecat, subscription as subs
 from app.services.debug_bus import publish as _dbg
 from app.services.vision import (
     VisionMatch,
@@ -151,6 +157,8 @@ class IdentifyOut(BaseModel):
     suggestions: list[IdentifySuggestion] = Field(default_factory=list)
     timings_ms: dict[str, int] = Field(default_factory=dict)
     debug: dict[str, Any] = Field(default_factory=dict)
+    # Cuota diaria: {used, limit, premium}. Opcional: clientes viejos lo ignoran.
+    quota: Optional[dict] = None
 
 
 class IdentifyBase64(BaseModel):
@@ -807,12 +815,104 @@ _IDENTIFY_SLOTS = asyncio.Semaphore(2)
 _MAX_IMAGE_BYTES = 12 * 1024 * 1024
 
 
-async def _identify_guarded(request: Request, data: bytes, brand: Optional[str]) -> IdentifyOut:
+# Reconciliación con RevenueCat bajo demanda: máximo una por usuario cada 60 s
+# (en memoria, un solo proceso).
+_RECONCILE_EVERY_S = 60
+_last_reconcile: dict[str, float] = {}
+_reconcile_lock = threading.Lock()
+
+
+def _reconcile_allowed(user_id: str) -> bool:
+    now = time.monotonic()
+    with _reconcile_lock:
+        last = _last_reconcile.get(user_id)
+        if last is not None and now - last < _RECONCILE_EVERY_S:
+            return False
+        _last_reconcile[user_id] = now
+        return True
+
+
+def _premium_state(db, user_id: str) -> tuple[bool, bool]:
+    """(es premium, su vencimiento ya pasó y sigue por gracia)."""
+    premium = subs.is_premium(db, user_id)
+    expired = False
+    if premium:
+        doc = db.subscriptions.find_one({"user_id": user_id}) or {}
+        exp = doc.get("expires_at")
+        expired = exp is not None and subs._utc(exp) < datetime.now(timezone.utc)
+    return premium, expired
+
+
+async def _reconcile(db, user_id: str) -> None:
+    """Fail-open: si RevenueCat falla se mantiene el estado local."""
+    if not _reconcile_allowed(user_id):
+        return
+    try:
+        await asyncio.to_thread(revenuecat.sync_user, db, user_id)
+    except Exception as exc:  # noqa: BLE001
+        _dbg("router", f"reconciliación RevenueCat falló: {exc}")
+
+
+def _quota_denied() -> JSONResponse:
+    limit = get_settings().free_daily_scans
+    return JSONResponse(
+        status_code=402,
+        content={
+            "detail": "Llegaste al límite diario de escaneos. Hazte Premium para escanear sin límite.",
+            "code": "scan_limit_reached",
+            "limit": limit,
+            "resets_at": subs.next_reset().isoformat(),
+        },
+    )
+
+
+async def _identify_guarded(
+    request: Request, data: bytes, brand: Optional[str], user: CurrentUser
+):
     hit_or_429("identify", client_ip(request), limit=30, per_seconds=60)
     if len(data) > _MAX_IMAGE_BYTES:
         raise HTTPException(status_code=413, detail="Imagen muy grande (máx 12 MB)")
-    async with _IDENTIFY_SLOTS:
-        return await asyncio.to_thread(_run_identify, data, brand)
+
+    uid = user.id
+    quota_on = get_settings().scan_limit_enabled
+    db = get_db() if quota_on else None
+    reserved = False
+    premium = False
+    if quota_on:
+        premium, expired = await asyncio.to_thread(_premium_state, db, uid)
+        if premium and expired:
+            await _reconcile(db, uid)
+            premium, _ = await asyncio.to_thread(_premium_state, db, uid)
+        if not premium:
+            ok, _used = await asyncio.to_thread(subs.reserve_scan, db, uid)
+            if not ok:
+                await _reconcile(db, uid)
+                premium = await asyncio.to_thread(subs.is_premium, db, uid)
+                if not premium:
+                    ok, _used = await asyncio.to_thread(subs.reserve_scan, db, uid)
+                    if not ok:
+                        # Antes del semáforo: un 402 no ocupa slot de CPU.
+                        return _quota_denied()
+            reserved = not premium
+
+    try:
+        async with _IDENTIFY_SLOTS:
+            out = await asyncio.to_thread(_run_identify, data, brand)
+    except BaseException:
+        if reserved:
+            await asyncio.to_thread(subs.release_scan, db, uid)
+        raise
+    if reserved and out.item is None and not out.suggestions:
+        await asyncio.to_thread(subs.release_scan, db, uid)
+        reserved = False
+    if quota_on:
+        status_ = await asyncio.to_thread(subs.get_status, db, uid)
+        out.quota = {
+            "used": int(status_["scans_used"]),
+            "limit": get_settings().free_daily_scans,
+            "premium": premium,
+        }
+    return out
 
 
 @router.post("/identify", response_model=IdentifyOut)
@@ -821,6 +921,7 @@ async def identify_upload(
     image: Optional[UploadFile] = File(default=None),
     image_base64: Optional[str] = Form(default=None),
     brand: Optional[str] = Form(default=None),
+    user: CurrentUser = Depends(get_current_user),
 ) -> IdentifyOut:
     """Sube la foto (multipart `image` o form `image_base64`) y recibe la pieza.
 
@@ -845,11 +946,15 @@ async def identify_upload(
 
     # En un thread: el event loop queda libre para el SSE de /lab/stream
     # mientras corre el pipeline (que es CPU-bound y largo).
-    return await _identify_guarded(request, data, brand)
+    return await _identify_guarded(request, data, brand, user)
 
 
 @router.post("/identify/base64", response_model=IdentifyOut)
-async def identify_b64(body: IdentifyBase64, request: Request) -> IdentifyOut:
+async def identify_b64(
+    body: IdentifyBase64,
+    request: Request,
+    user: CurrentUser = Depends(get_current_user),
+) -> IdentifyOut:
     """Alternativa JSON: { image_base64: '...' }."""
     raw = body.image_base64
     if "," in raw and raw.strip().startswith("data:"):
@@ -858,7 +963,7 @@ async def identify_b64(body: IdentifyBase64, request: Request) -> IdentifyOut:
         data = base64.b64decode(raw)
     except Exception:
         raise HTTPException(status_code=400, detail="image_base64 inválido")
-    return await _identify_guarded(request, data, body.brand)
+    return await _identify_guarded(request, data, body.brand, user)
 
 
 @router.post("/identify/peritaje", response_model=PeritajeOut)

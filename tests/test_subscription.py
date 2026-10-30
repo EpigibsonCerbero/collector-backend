@@ -340,3 +340,198 @@ def test_product_change_records_new_product():
     _post(_ev("PRODUCT_CHANGE", "p1", 1000, new_product_id="curio_pro_annual", expiration_at_ms=later))
     doc = _db.subscriptions.find_one({"user_id": "u-w"})
     assert doc["product_id"] == "curio_pro_annual" and doc["period"] == "annual"
+
+
+# ── Task 3: cuota en el identify y freno de registros ───────────────────────
+import threading
+from unittest.mock import patch as _patch
+
+from pymongo.errors import DuplicateKeyError
+
+from app.routers import auth as auth_router
+from app.routers import identify as identify_router
+from app.routers.identify import IdentifyOut, IdentifySuggestion
+
+_iapi = FastAPI()
+_iapi.include_router(identify_router.router, prefix="/api/v1")
+_iapi.include_router(auth_router.router, prefix="/api/v1")
+_ic = TestClient(_iapi)
+IDENT = "/api/v1/identify/base64"
+_IMG = {"image_base64": "aGVsbG8="}
+
+
+def _hdr(uid):
+    return {"Authorization": f"Bearer {create_access_token(uid, uid)}"}
+
+
+def _ok_result():
+    return IdentifyOut(method="c", confidence=0.9, needs_manual=False, item={"id": "v1"})
+
+
+@pytest.fixture(autouse=True)
+def _identify_state():
+    identify_router._last_reconcile.clear()
+    with _patch.object(identify_router, "_run_identify", side_effect=lambda *a, **k: _ok_result()):
+        yield
+
+
+def _scan(uid):
+    return _ic.post(IDENT, json=_IMG, headers=_hdr(uid))
+
+
+def _used(uid):
+    d = _db.scan_usage.find_one({"user_id": uid, "day": sub.today_key()})
+    return d["count"] if d else 0
+
+
+def test_reserve_scan_first_scan_race_loser_still_gets_slot():
+    uid = _user("race1")
+    real = _db.scan_usage.find_one_and_update
+
+    calls = []
+
+    def flaky(*a, **k):
+        calls.append(1)
+        if len(calls) == 1:
+            raise DuplicateKeyError("dup")  # perdió la carrera del primer escaneo
+        return real(*a, **k)
+
+    with _patch.object(_db.scan_usage, "find_one_and_update", side_effect=flaky):
+        _db.scan_usage.insert_one({"user_id": uid, "day": sub.today_key(), "count": 1})
+        assert sub.reserve_scan(_db, uid) == (True, 2)
+    assert _used(uid) == 2
+
+
+def test_reserve_scan_duplicate_at_limit_denies():
+    uid = _user("race2")
+    _db.scan_usage.insert_one({"user_id": uid, "day": sub.today_key(), "count": 20})
+    assert sub.reserve_scan(_db, uid) == (False, 20)
+
+
+def test_identify_requires_session():
+    assert _ic.post(IDENT, json=_IMG).status_code == 401
+
+
+def test_identify_402_after_20_with_flag_on():
+    uid = _user("q20")
+    for i in range(20):
+        r = _scan(uid)
+        assert r.status_code == 200, r.text
+        assert r.json()["quota"] == {"used": i + 1, "limit": 20, "premium": False}
+    with _patch.object(identify_router.revenuecat, "sync_user", return_value=False):
+        r = _scan(uid)
+    assert r.status_code == 402
+    body = r.json()
+    assert isinstance(body["detail"], str)
+    assert body["code"] == "scan_limit_reached" and body["limit"] == 20
+    assert body["resets_at"] == sub.next_reset().isoformat() or body["resets_at"].startswith("20")
+    assert _used(uid) == 20
+
+
+def test_identify_unlimited_when_flag_off(monkeypatch):
+    monkeypatch.setattr(get_settings(), "scan_limit_enabled", False)
+    uid = _user("off")
+    for _ in range(25):
+        assert _scan(uid).status_code == 200
+    assert _used(uid) == 0
+
+
+def test_premium_not_counted():
+    uid = _user("prem")
+    _sub(uid, expires_at=datetime.now(UTC) + timedelta(days=5))
+    for _ in range(22):
+        r = _scan(uid)
+        assert r.status_code == 200
+    assert r.json()["quota"]["premium"] is True
+    assert _used(uid) == 0
+
+
+def test_two_parallel_requests_at_19_only_one_passes():
+    uid = _user("par")
+    _db.scan_usage.insert_one({"user_id": uid, "day": sub.today_key(), "count": 19})
+    hdr = _hdr(uid)
+    barrier = threading.Barrier(2)
+    codes = []
+
+    def go():
+        barrier.wait()
+        with _patch.object(identify_router.revenuecat, "sync_user", return_value=False):
+            codes.append(_ic.post(IDENT, json=_IMG, headers=hdr).status_code)
+
+    ts = [threading.Thread(target=go) for _ in range(2)]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    assert sorted(codes) == [200, 402]
+    assert _used(uid) == 20
+
+
+def test_release_on_exception_and_on_empty_result():
+    uid = _user("rel")
+    with _patch.object(identify_router, "_run_identify", side_effect=RuntimeError("boom")):
+        c = TestClient(_iapi, raise_server_exceptions=False)
+        assert c.post(IDENT, json=_IMG, headers=_hdr(uid)).status_code == 500
+    assert _used(uid) == 0
+    with _patch.object(identify_router, "_run_identify", return_value=IdentifyOut()):
+        r = _scan(uid)
+        assert r.status_code == 200
+    assert _used(uid) == 0
+
+
+def test_manual_with_suggestions_counts():
+    uid = _user("man")
+    res = IdentifyOut(suggestions=[IdentifySuggestion(id="s1", name="x")])
+    with _patch.object(identify_router, "_run_identify", return_value=res):
+        assert _scan(uid).status_code == 200
+    assert _used(uid) == 1
+
+
+def test_402_triggers_single_reconcile_and_grants_if_premium():
+    uid = _user("rec")
+    _db.scan_usage.insert_one({"user_id": uid, "day": sub.today_key(), "count": 20})
+    calls = []
+
+    def fake_sync(db, user_id):
+        calls.append(user_id)
+        _sub(user_id, expires_at=datetime.now(UTC) + timedelta(days=5))
+        return True
+
+    with _patch.object(identify_router.revenuecat, "sync_user", side_effect=fake_sync):
+        r1 = _scan(uid)
+        r2 = _scan(uid)
+    assert r1.status_code == 200 and r1.json()["quota"]["premium"] is True
+    assert r2.status_code == 200
+    assert calls == [uid]
+    assert _used(uid) == 20
+
+
+def test_reconcile_rate_limited_to_one_per_60s():
+    uid = _user("rec2")
+    _db.scan_usage.insert_one({"user_id": uid, "day": sub.today_key(), "count": 20})
+    with _patch.object(identify_router.revenuecat, "sync_user", return_value=False) as m:
+        assert _scan(uid).status_code == 402
+        assert _scan(uid).status_code == 402
+    assert m.call_count == 1
+
+
+def test_reconcile_failure_keeps_free_limit_no_500():
+    uid = _user("recfail")
+    _db.scan_usage.insert_one({"user_id": uid, "day": sub.today_key(), "count": 20})
+    with _patch.object(identify_router.revenuecat, "sync_user", side_effect=RuntimeError("down")):
+        assert _scan(uid).status_code == 402
+
+
+def test_expired_premium_in_grace_triggers_reconcile():
+    uid = _user("grace")
+    _sub(uid, expires_at=datetime.now(UTC) - timedelta(hours=2))
+    with _patch.object(identify_router.revenuecat, "sync_user", return_value=True) as m:
+        r = _scan(uid)
+    assert r.status_code == 200 and m.call_count == 1
+
+
+def test_register_blocked_after_5_per_ip():
+    codes = []
+    for i in range(6):
+        r = _ic.post("/api/v1/auth/register", json={
+            "email": f"reg{i}@example.com", "username": f"reguser{i}", "password": "Passw0rd!x"})
+        codes.append(r.status_code)
+    assert codes[:5] == [201] * 5 and codes[5] == 429, codes
