@@ -2621,6 +2621,22 @@ def identify_image(image_bytes: bytes, brand_hint: str | None = None) -> VisionR
     return res
 
 
+def _warmup_yolo() -> None:
+    """YOLO solo lo usa el alta por IA (validar el recorte): se carga al
+    arrancar si está activa, nunca dentro de un cupo del identify."""
+    try:
+        from app.config import get_settings
+
+        if not get_settings().ai_catalog_enabled:
+            return
+        from app.services import yolo_crop
+
+        yolo_crop.warmup()
+        print(f"[vision] warmup YOLO {'OK' if yolo_crop.loaded() else 'no disponible'}", flush=True)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[vision] warmup YOLO falló: {type(exc).__name__}", flush=True)
+
+
 def warmup() -> None:
     """Carga modelo + índice al arrancar. EasyOCR/YOLO cargan lazy
     (son muy pesados para el init phase de Lambda que solo da 10s)."""
@@ -2664,3 +2680,4 @@ def warmup() -> None:
         _index_names()
     except Exception as exc:  # noqa: BLE001
         print(f"[vision] warmup galería Mini GT falló: {exc}", flush=True)
+    _warmup_yolo()

@@ -9,7 +9,10 @@ Modelo: YOLOv8n (6MB) — detecta 'car', 'motorcycle', etc. del COCO dataset.
 
 from __future__ import annotations
 
+import os
 import threading
+import time
+from pathlib import Path
 
 import numpy as np
 
@@ -19,18 +22,73 @@ _model = None
 # Clases COCO de vehículos
 _VEHICLE_CLASSES = {1: "bicycle", 2: "car", 3: "motorcycle", 5: "bus", 7: "truck"}
 
+# Pesos en ruta ABSOLUTA: con una ruta relativa ultralytics intenta DESCARGAR
+# el modelo (dentro de una petición). Sin fichero no se carga ni se descarga.
+_DEFAULT_WEIGHTS = Path(__file__).resolve().parents[2] / "data" / "models" / "yolov8n.pt"
+
+# Caché negativa: tras un fallo de import/carga no se reintenta en esta ventana.
+_NEG_TTL_S = 600.0
+_clock = time.monotonic  # inyectable en pruebas
+_failed_until = 0.0
+
+
+class YoloUnavailable(RuntimeError):
+    """YOLO no está disponible (sin pesos, fallo de carga o caché negativa)."""
+
+
+def _weights_path() -> Path:
+    return Path(os.environ.get("YOLO_WEIGHTS") or _DEFAULT_WEIGHTS)
+
+
+def loaded() -> bool:
+    """¿El modelo ya está en memoria? (sin cargarlo)."""
+    return _model is not None
+
+
+def _neg_active() -> bool:
+    return _clock() < _failed_until
+
+
+def _fail(why: str) -> None:
+    """Abre la caché negativa; registra UNA línea por ventana."""
+    global _failed_until
+    first = not _neg_active()
+    _failed_until = _clock() + _NEG_TTL_S
+    if first:
+        print(f"[yolo] no disponible ({why}); sin reintento en {int(_NEG_TTL_S)} s", flush=True)
+
 
 def _get_yolo():
     global _model
-    if _model is None:
-        with _lock:
-            if _model is None:
-                from ultralytics import YOLO
+    if _model is not None:
+        return _model
+    with _lock:
+        if _model is not None:
+            return _model
+        if _neg_active():
+            raise YoloUnavailable("caché negativa")
+        path = _weights_path()
+        if not path.is_file():
+            _fail("sin fichero de pesos")
+            raise YoloUnavailable("sin pesos")
+        try:
+            from ultralytics import YOLO
 
-                print("[yolo] cargando YOLOv8n...", flush=True)
-                _model = YOLO("yolov8n.pt")
-                print("[yolo] cargado", flush=True)
+            model = YOLO(str(path))
+        except Exception as exc:  # noqa: BLE001
+            _fail(type(exc).__name__)
+            raise YoloUnavailable(type(exc).__name__) from exc
+        _model = model
+        print("[yolo] cargado", flush=True)
     return _model
+
+
+def warmup() -> None:
+    """Carga al arrancar (fuera de cualquier cupo del identify). Nunca lanza."""
+    try:
+        _get_yolo()
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def detect_and_crop_vehicle(image_bytes: bytes) -> list[bytes]:
@@ -79,6 +137,8 @@ def detect_and_crop_vehicle(image_bytes: bytes) -> list[bytes]:
 
         return [image_bytes]
 
+    except YoloUnavailable:
+        return [image_bytes]  # ya registrado una vez por ventana
     except Exception as exc:
         print(f"[yolo] error: {type(exc).__name__}: {exc}", flush=True)
         return [image_bytes]
@@ -97,6 +157,8 @@ def vehicle_boxes(im) -> list[tuple[float, float, float, float]] | None:
             if int(box.cls[0]) in _VEHICLE_CLASSES:
                 boxes.append(tuple(box.xyxy[0].tolist()))
         return boxes
+    except YoloUnavailable:
+        return None  # ya registrado una vez por ventana
     except Exception as exc:  # noqa: BLE001
         print(f"[yolo] vehicle_boxes no disponible: {type(exc).__name__}", flush=True)
         return None

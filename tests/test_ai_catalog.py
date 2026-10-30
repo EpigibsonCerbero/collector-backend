@@ -448,6 +448,7 @@ def aienv(monkeypatch, tmp_path):
         return list(y) if y is not None else None
 
     monkeypatch.setattr(_yolo, "vehicle_boxes", yolo)
+    monkeypatch.setattr(_yolo, "loaded", lambda: True)  # precalentado (P3)
 
     def emb(im):
         state["embed_calls"].append(im)
@@ -2817,3 +2818,109 @@ def test_p1_budget_constants_defaults():
     assert idn._RESOLVE_MIN_START_S == 1.5 and idn._RESOLVE_MIN_TIMEOUT_S == 1.0
     assert idn._RESOLVE_CREATE_MIN_S == 4.0
     assert cv._MAX_ATTEMPTS == 2 and cv._MIN_RETRY_S == 1.0
+
+
+# P3: YOLO sin descarga en ejecución, caché negativa, sin cargar bajo el cupo.
+import types as _types
+
+
+class _FakeUltra(_types.ModuleType):
+    """`ultralytics` falso: cuenta los accesos a YOLO (= intento de import)."""
+
+    def __init__(self, ctor):
+        super().__init__("ultralytics")
+        self.imports = 0
+        self.built = []
+        self._ctor = ctor
+
+    @property
+    def YOLO(self):  # noqa: N802
+        self.imports += 1
+        return self._ctor
+
+
+class _FakeModel:
+    def __init__(self, path):
+        self.path = path
+
+    def predict(self, im, conf=0.25, verbose=False):
+        class _B:
+            def __init__(self, cls, xyxy):
+                self.cls = [cls]
+                self.xyxy = [_NS(tolist=lambda: list(xyxy))]
+        return [_NS(boxes=[_B(2, (1, 2, 30, 20)), _B(0, (0, 0, 5, 5))])]
+
+
+@pytest.fixture
+def yolo_env(monkeypatch, tmp_path):
+    clock = {"t": 5000.0}
+    monkeypatch.setattr(_yolo, "_model", None)
+    monkeypatch.setattr(_yolo, "_failed_until", 0.0)
+    monkeypatch.setattr(_yolo, "_clock", lambda: clock["t"])
+    weights = tmp_path / "yolov8n.pt"
+    monkeypatch.setenv("YOLO_WEIGHTS", str(weights))
+    return clock, weights
+
+
+def test_p3_default_weights_path_is_absolute_under_backend(monkeypatch):
+    monkeypatch.delenv("YOLO_WEIGHTS", raising=False)
+    p = _yolo._weights_path()
+    assert p.is_absolute() and p.parts[-3:] == ("data", "models", "yolov8n.pt")
+    assert p.parents[2] == Path(__file__).resolve().parents[1]
+
+
+def test_p3_missing_weights_none_without_importing(yolo_env, monkeypatch):
+    fake = _FakeUltra(_FakeModel)
+    monkeypatch.setitem(sys.modules, "ultralytics", fake)
+    assert _yolo.vehicle_boxes(_Image.new("RGB", (40, 30))) is None
+    assert fake.imports == 0 and not _yolo.loaded()
+
+
+def test_p3_load_failure_cached_600s_and_logged_once(yolo_env, monkeypatch, capsys):
+    clock, weights = yolo_env
+    weights.write_bytes(b"w")
+    built = []
+
+    def boom(path):
+        built.append(path)
+        raise RuntimeError("torch roto")
+
+    fake = _FakeUltra(boom)
+    monkeypatch.setitem(sys.modules, "ultralytics", fake)
+    img = _Image.new("RGB", (40, 30))
+    assert _yolo.vehicle_boxes(img) is None
+    clock["t"] += 599
+    assert _yolo.vehicle_boxes(img) is None
+    assert len(built) == 1 and fake.imports == 1
+    assert len([l for l in capsys.readouterr().out.splitlines() if l.startswith("[yolo]")]) == 1
+    clock["t"] += 2  # pasada la ventana: reintenta
+    assert _yolo.vehicle_boxes(img) is None
+    assert len(built) == 2
+
+
+def test_p3_loaded_detects_as_today(yolo_env, monkeypatch):
+    _clock, weights = yolo_env
+    weights.write_bytes(b"w")
+    fake = _FakeUltra(_FakeModel)
+    monkeypatch.setitem(sys.modules, "ultralytics", fake)
+    assert _yolo.vehicle_boxes(_Image.new("RGB", (40, 30))) == [(1, 2, 30, 20)]
+    assert _yolo.loaded() and _yolo._model.path == str(weights)
+    _yolo.vehicle_boxes(_Image.new("RGB", (40, 30)))
+    assert fake.imports == 1  # se carga una sola vez
+
+
+def test_p3_prepare_image_skips_check_when_model_not_loaded(aienv, monkeypatch):
+    monkeypatch.setattr(_yolo, "loaded", lambda: False)
+    prep = aic.prepare_image(PHOTO)
+    assert prep.publishable is False and aienv["yolo_calls"] == 0
+    out = aic.create_from_read(_db, "u1", _read(), PHOTO)
+    assert out["outcome"] == "created" and out["main_image_url"] is None
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_p3_vision_warmup_loads_yolo_only_when_ai_catalog_on(monkeypatch, enabled):
+    calls = []
+    monkeypatch.setattr(get_settings(), "ai_catalog_enabled", enabled)
+    monkeypatch.setattr(_yolo, "warmup", lambda: calls.append(1))
+    _vis._warmup_yolo()
+    assert calls == ([1] if enabled else [])
