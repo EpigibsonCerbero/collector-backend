@@ -1060,8 +1060,8 @@ def _valid_receipt(db, uid: str, ihash: str) -> dict | None:
     return None
 
 
-def _resolve_new_work(db, uid: str, data: bytes, receipt: dict) -> tuple[str, dict | None]:
-    """(decisión para el log, pieza o None). Bloqueante: IA, recorte, embed, Mongo."""
+def _read_and_gate(data: bytes, receipt: dict) -> tuple[str | None, dict | None]:
+    """(motivo de rechazo o None, lectura). Red, sin CPU: va FUERA de `_IDENTIFY_SLOTS`."""
     try:
         read = claude_vision.read_for_catalog(data)
     except Exception:  # noqa: BLE001
@@ -1069,20 +1069,38 @@ def _resolve_new_work(db, uid: str, data: bytes, receipt: dict) -> tuple[str, di
     if read is None:
         return "no_ai", None
     reason = ai_catalog.gate(read, receipt)
-    if reason:
-        return f"rejected:{reason}", None
+    return (f"rejected:{reason}", read) if reason else (None, read)
+
+
+def _mark_ai_tried(db, receipt: dict) -> None:
+    """La IA ya leyó este escaneo y no hubo pieza: repetirlo no vuelve a pagarla."""
+    try:
+        db.identify_receipts.update_one({"_id": receipt["_id"]}, {"$set": {"ai_tried": True}})
+    except Exception:  # noqa: BLE001
+        _log.warning("ai_catalog: no se pudo marcar el recibo", exc_info=True)
+
+
+def _create_piece(db, uid: str, read: dict, data: bytes, receipt: dict) -> tuple[str, dict | None]:
+    """(decisión para el log, pieza o None). Recorte + embed + Mongo: CPU, va bajo el semáforo."""
     try:
         piece = ai_catalog.create_from_read(db, uid, read, data)
     except Exception:  # noqa: BLE001
         _log.warning("ai_catalog: alta fallida user=%s", uid, exc_info=True)
         return "uncertain:error", None
     outcome = piece.get("outcome")
-    if outcome == "created":
-        ai_catalog.consume_daily(db, uid)
-    elif outcome != "duplicate":
+    if outcome not in ("created", "duplicate"):
         return f"uncertain:{piece.get('reason') or 'unknown'}", None
-    # Un escaneo sirve para una sola pieza: sin repetición para gastar llamadas.
-    db.identify_receipts.delete_many({"user_id": uid, "image_hash": receipt.get("image_hash")})
+    # La pieza ya existe: un fallo de contabilidad nunca convierte el alta en 500.
+    if outcome == "created":
+        try:
+            ai_catalog.consume_daily(db, uid)
+        except Exception:  # noqa: BLE001
+            _log.warning("ai_catalog: no se pudo contar el alta user=%s", uid, exc_info=True)
+    try:
+        # Un escaneo sirve para una sola pieza: sin repetición para gastar llamadas.
+        db.identify_receipts.delete_many({"user_id": uid, "image_hash": receipt.get("image_hash")})
+    except Exception:  # noqa: BLE001
+        _log.warning("ai_catalog: no se pudo consumir el recibo user=%s", uid, exc_info=True)
     return outcome, ai_catalog.strip_internal(piece)
 
 
@@ -1105,12 +1123,21 @@ async def identify_resolve_new(
     receipt = await asyncio.to_thread(_valid_receipt, db, uid, image_hash(data))
     if receipt is None:
         raise HTTPException(status_code=403, detail="Escanea la pieza de nuevo")
+    if receipt.get("ai_tried"):
+        _log.info("ai_catalog rejected:ai_tried user=%s", uid)
+        return IdentifyOut()
     hit_or_429("resolve_new", uid, limit=6, per_seconds=600)
     if await asyncio.to_thread(ai_catalog.daily_cap_reached, db, uid):
         _log.info("ai_catalog cap user=%s", uid)
         return IdentifyOut()
-    async with _IDENTIFY_SLOTS:
-        decision, piece = await asyncio.to_thread(_resolve_new_work, db, uid, data, receipt)
+    # La lectura espera a la red: fuera del semáforo para no frenar los identify.
+    decision, read = await asyncio.to_thread(_read_and_gate, data, receipt)
+    piece = None
+    if decision is None:
+        async with _IDENTIFY_SLOTS:
+            decision, piece = await asyncio.to_thread(_create_piece, db, uid, read, data, receipt)
+    if read is not None and piece is None:
+        await asyncio.to_thread(_mark_ai_tried, db, receipt)
     _log.info("ai_catalog %s user=%s", decision, uid)
     if piece is None:
         return IdentifyOut()

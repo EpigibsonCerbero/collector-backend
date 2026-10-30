@@ -1053,3 +1053,65 @@ def test_does_not_consume_extra_scan_quota(rn, monkeypatch):
     _receipt()
     assert _post().json()["method"] == "o"
     assert _db.scan_usage.find_one({"user_id": "u1"})["count"] == 5 and called == []
+
+
+# ── Task 5, ronda 1: la lectura no ocupa slot, sin repetición pagada, sin 500 tras el alta
+
+
+def test_ai_read_does_not_hold_identify_slot(rn, monkeypatch):
+    seen = {}
+    real_read = cv.read_for_catalog
+    real_create = aic.create_from_read
+
+    def read_spy(data):
+        seen["read"] = idn._IDENTIFY_SLOTS._value
+        return real_read(data)
+
+    def create_spy(*a, **k):
+        seen["create"] = idn._IDENTIFY_SLOTS._value
+        return real_create(*a, **k)
+
+    monkeypatch.setattr(cv, "read_for_catalog", read_spy)
+    monkeypatch.setattr(aic, "create_from_read", create_spy)
+    _receipt()
+    assert _post().json()["method"] == "o"
+    assert seen == {"read": 2, "create": 1}  # solo el alta (CPU) toma el semáforo
+
+
+def test_replay_after_gate_rejection_makes_no_ai_call(rn):
+    _receipt(twins=True)
+    assert _is_manual(_post().json()) and len(rn["calls"]) == 1
+    assert _db.identify_receipts.find_one({})["ai_tried"] is True
+    r = _post()
+    assert r.status_code == 200 and _is_manual(r.json())
+    assert len(rn["calls"]) == 1 and _rows() == 0
+
+
+def test_replay_after_uncertain_makes_no_ai_call(rn, aienv):
+    aienv["truncate"] = True
+    _receipt()
+    assert _is_manual(_post().json()) and len(rn["calls"]) == 1
+    aienv["truncate"] = False  # aunque ahora sí se pudiera crear, el escaneo ya se gastó
+    assert _is_manual(_post().json())
+    assert len(rn["calls"]) == 1 and _rows() == 0
+
+
+def test_retry_after_ai_error_calls_ai_again(rn):
+    _receipt()
+    rn["read"] = RuntimeError("api down")
+    assert _is_manual(_post().json())
+    assert not _db.identify_receipts.find_one({}).get("ai_tried")
+    rn["read"] = _read()
+    assert _post().json()["method"] == "o"
+    assert len(rn["calls"]) == 2
+
+
+def test_bookkeeping_failure_after_create_is_not_500(rn, monkeypatch):
+    def boom(*a, **k):
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(aic, "consume_daily", boom)
+    _receipt()
+    r = _post()
+    assert r.status_code == 200 and r.json()["method"] == "o" and _rows() == 1
+    assert _db.identify_receipts.count_documents({}) == 0
