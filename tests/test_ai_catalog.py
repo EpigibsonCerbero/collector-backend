@@ -3228,3 +3228,32 @@ def test_q2_flag_off_spawns_nothing(q2, aienv, monkeypatch):
     monkeypatch.setattr(get_settings(), "ai_catalog_enabled", False)
     aic.prepare_image(PHOTO)
     assert q2["threads"] == [] and q2["ctor_threads"] == [] and not _yolo.loaded()
+
+
+# M3: el chequeo del reloj justo antes de `create_new` (punto sin retorno).
+
+
+class _SlowSlots(_Slots):
+    """Cupo falso: la espera número `slow_at` se come `secs` del reloj falso."""
+
+    def __init__(self, clk, slow_at, secs):
+        super().__init__()
+        self.clk, self.slow_at, self.secs = clk, slow_at, secs
+
+    async def acquire(self):
+        self.n += 1
+        if self.n == self.slow_at:
+            self.clk["t"] += self.secs
+        return True
+
+
+def test_m3_clock_passes_between_second_slot_and_create_new(rn, aienv, clk, monkeypatch, caplog):
+    slots = _SlowSlots(clk, slow_at=2, secs=11.6)  # el cupo llega con 1.4 s (< 1.5)
+    monkeypatch.setattr(idn, "_IDENTIFY_SLOTS", slots)
+    log = []
+    _slow(clk, monkeypatch, "create_new", 0.0, log)
+    before = _snapshot(aienv)
+    assert _is_manual(_q1_post(caplog))
+    assert log == [] and slots.n == 2 and slots.released == 2  # create_new nunca arrancó
+    assert "ai_catalog uncertain:timeout user=u1" in caplog.text
+    _assert_nothing_written(aienv, before)
