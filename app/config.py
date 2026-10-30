@@ -36,6 +36,11 @@ class Settings(BaseSettings):
     ai_catalog_daily_cap: int = 10
     ai_catalog_max_top_score: float = 0.75
     ai_catalog_receipt_ttl_s: int = 600
+    # Barreras anti-duplicado (inclinadas a NO crear): cobertura del nombre de
+    # un candidato textual por la lectura, y similitud del recorte del coche
+    # contra el índice completo (vistas aisladas incluidas).
+    ai_catalog_dup_text_overlap: float = 0.8
+    ai_catalog_dup_embed_score: float = 0.90
 
     # Bootstrap admin (dev). Con la contraseña por defecto NO se crea y, si ya
     # existe con ella, se desactiva al arrancar (estaba publicada en el repo).

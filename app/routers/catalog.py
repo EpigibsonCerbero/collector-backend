@@ -493,59 +493,97 @@ def create_catalog_item(
 ) -> ItemVariantOut:
     """Upsert de items_master + item_variants (equivale a createCatalogItem)."""
     db = get_db()
-    now = _now()
     data = body.model_dump()
+    master_fields = {
+        k: data.pop(k)
+        for k in (
+            "name",
+            "manufacturer",
+            "release_year",
+            "category_id",
+            "brand_id",
+            "series_id",
+            "casting_name",
+            "designer",
+            "scale",
+        )
+    }
+    variant, master = upsert_catalog_piece(db, master_fields, data, user.id)
+    return _variant_out(variant, master)
+
+
+def upsert_catalog_piece(
+    db, master: dict, variant: dict, user_id: str | None
+) -> tuple[dict, dict]:
+    """Alta (o reutilización) de maestro + variante ya persistidos.
+
+    `master`: campos del maestro (name, manufacturer, release_year, …).
+    `variant`: campos de la variante; `id` y `ai_local_hash` opcionales.
+    Devuelve (variante, maestro) tal como están en Mongo."""
+    v, m, _created = _upsert_catalog_piece(db, master, variant, user_id)
+    return v, m
+
+
+def _upsert_catalog_piece(
+    db, master: dict, variant: dict, user_id: str | None, dedupe_id: bool = False
+) -> tuple[dict, dict, bool]:
+    """Igual que `upsert_catalog_piece` y además dice si creó la variante.
+
+    `dedupe_id=True` (solo el alta automática): si ya existe una variante con
+    ese `_id`, se devuelve en vez de fallar con 409."""
+    now = _now()
+    data = dict(variant)
+    master_fields = dict(master)
 
     ai_hash = data.pop("ai_local_hash", None)
     variant_id = data.pop("id", None)
-    master_fields = {
-        "name": data.pop("name"),
-        "manufacturer": data.pop("manufacturer"),
-        "release_year": data.pop("release_year"),
-        "category_id": data.pop("category_id"),
-        "brand_id": data.pop("brand_id"),
-        "series_id": data.pop("series_id"),
-        "casting_name": data.pop("casting_name"),
-        "designer": data.pop("designer"),
-        "scale": data.pop("scale"),
-    }
+    _id = None
+    if variant_id:
+        _id = oid(variant_id) if _is_oid(variant_id) else variant_id
+
+    def _found(doc: dict) -> tuple[dict, dict, bool]:
+        return doc, _load_master(db, doc), False
+
+    if dedupe_id and _id is not None:
+        same = db.variants.find_one({"_id": _id})
+        if same:
+            return _found(same)
 
     # Dedup blando: mismo toy_number + variant_name → reutiliza variante
     existing = None
     if data.get("toy_number"):
         existing = db.variants.find_one(
-            {"toy_number": data["toy_number"], "variant_name": body.variant_name}
+            {"toy_number": data["toy_number"], "variant_name": data.get("variant_name")}
         )
     if existing is None and ai_hash:
         existing = db.variants.find_one({"ai_local_hash": ai_hash})
     if existing:
-        return _variant_out(existing, _load_master(db, existing))
+        return _found(existing)
 
     # Maestro: reutiliza por (name, manufacturer, release_year)
-    master = db.items.find_one(
+    master_doc = db.items.find_one(
         {
             "name": master_fields["name"],
             "manufacturer": master_fields["manufacturer"],
             "release_year": master_fields["release_year"],
         }
     )
-    if master is None:
+    if master_doc is None:
         master_doc = {k: v for k, v in master_fields.items() if v is not None}
         master_doc["created_at"] = now
         res_m = db.items.insert_one(master_doc)
-        master_id = str(res_m.inserted_id)
-    else:
-        master_id = str(master["_id"])
+        master_doc["_id"] = res_m.inserted_id
+    master_id = str(master_doc["_id"])
 
     variant_doc = data
     variant_doc["item_master_id"] = master_id
     variant_doc["ai_local_hash"] = ai_hash or f"hash-{(data.get('toy_number') or variant_id or master_id).lower()}"
     variant_doc["created_at"] = now
     # Alta hecha por un usuario (no por el scrape): se marca para poder moderarla.
-    variant_doc["created_by"] = user.id
+    variant_doc["created_by"] = user_id
     variant_doc["user_submitted"] = True
-    if variant_id:
-        variant_doc["_id"] = oid(variant_id) if _is_oid(variant_id) else variant_id
+    if _id is not None:
+        variant_doc["_id"] = _id
 
     try:
         res = db.variants.insert_one(variant_doc)
@@ -554,10 +592,15 @@ def create_catalog_item(
         if "ai_local_hash" in str(exc) and ai_hash:
             dup = db.variants.find_one({"ai_local_hash": ai_hash})
             if dup:
-                return _variant_out(dup, _load_master(db, dup))
+                return _found(dup)
+        if dedupe_id and _id is not None:
+            # Carrera: otro usuario creó la misma pieza entre la búsqueda y el alta.
+            same = db.variants.find_one({"_id": _id})
+            if same:
+                return _found(same)
         raise HTTPException(status_code=409, detail="No se pudo crear la variante")
     variant_doc["_id"] = res.inserted_id
-    return _variant_out(variant_doc, _load_master(db, variant_doc))
+    return variant_doc, _load_master(db, variant_doc), True
 
 
 def _is_oid(value: str) -> bool:

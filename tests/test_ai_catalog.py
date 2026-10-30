@@ -384,3 +384,259 @@ def test_live_perf_overhead_100_entries(vidx):
     with_live = t()
     print(f"\nmatch_embedding base={base:.3f}ms live100={with_live:.3f}ms delta={with_live-base:.3f}ms")
     assert with_live - base < 5.0
+
+
+# ── Task 3: servicio ai_catalog ────────────────────────────────────────────
+import io as _io
+import uuid as _uuid
+from types import SimpleNamespace as _NS
+
+from PIL import Image as _Image
+
+from app.routers import catalog as _catr
+from app.routers import uploads as _upl
+from app.schemas import ItemVariantOut as _IVO
+from app.services import ai_catalog as aic
+from app.services import car_segment as _seg
+from app.services import dinov2_embed as _emb
+from app.services import subscription as _subs
+
+_NSID = _uuid.UUID("a9f73cdf-180a-5bd7-ac02-42c291653666")
+
+
+def _jpeg(color=(200, 30, 30), size=(64, 48)):
+    buf = _io.BytesIO()
+    _Image.new("RGB", size, color).save(buf, "JPEG")
+    return buf.getvalue()
+
+
+PHOTO = _jpeg()
+
+
+def _read(**kw):
+    r = {"es_diecast": True, "brand": "Mini GT", "casting": "Nissan Skyline GT-R R34",
+         "modelo": None, "color": "azul", "dorsal": None, "livery": "Bayside Blue",
+         "texto": "", "toy_number": None, "serie": None, "year": None, "confidence": "alto"}
+    r.update(kw)
+    return r
+
+
+@pytest.fixture
+def aienv(monkeypatch, tmp_path):
+    for coll in ("variants", "items", "ai_catalog_usage", "brands"):
+        _db[coll].delete_many({})
+    monkeypatch.setattr(_upl, "UPLOAD_DIR", tmp_path)
+    crop = _Image.new("RGB", (32, 32), (10, 10, 200))
+    state = {"seg": _NS(image=crop), "appends": [], "embed_calls": [],
+             "text": [], "match": []}
+
+    monkeypatch.setattr(_seg, "isolate_car", lambda im, *a, **k: state["seg"])
+
+    def emb(im):
+        state["embed_calls"].append(im)
+        return [1.0] + [0.0] * 767 if im is crop else [0.0, 1.0] + [0.0] * 766
+
+    monkeypatch.setattr(_emb, "embed_image", emb)
+    monkeypatch.setattr(_vis, "search_catalog_by_text", lambda q, top_k=8, budget_s=2.0: list(state["text"]))
+    monkeypatch.setattr(_vis, "match_embedding",
+                        lambda e, top_k=8, include_mv=False: list(state["match"]))
+    monkeypatch.setattr(_vis, "live_index_append",
+                        lambda entry, vec: state["appends"].append((dict(entry), list(vec))))
+    state["crop"] = crop
+    return state
+
+
+def _vm(id_, name, score):
+    return _vis.VisionMatch(id=id_, toy=None, name=name, score=score, source="ocr")
+
+
+def _seed_variant(_id="exist1", name="Nissan Skyline GT-R R34", variant_name="Bayside Blue", toy="MGT00100"):
+    _db.items.insert_one({"_id": "mexist", "name": name, "manufacturer": "Mini GT", "release_year": 2023})
+    _db.variants.insert_one({"_id": _id, "item_master_id": "mexist", "variant_name": variant_name,
+                             "toy_number": toy, "ai_local_hash": f"h-{_id}"})
+
+
+def test_gate_rejects_non_diecast():
+    assert aic.gate(None, {"top_score": 0.1}) == "no_diecast"
+    assert aic.gate(_read(es_diecast=False), {"top_score": 0.1}) == "no_diecast"
+
+
+def test_gate_rejects_low_confidence():
+    assert aic.gate(_read(confidence="medio"), {"top_score": 0.1}) == "low_confidence"
+    assert aic.gate(_read(confidence="bajo"), {}) == "low_confidence"
+    assert aic.gate(_read(brand=""), {"top_score": 0.1}) == "missing_identity"
+    assert aic.gate(_read(casting=None), {"top_score": 0.1}) == "missing_identity"
+
+
+def test_gate_rejects_twins_and_high_top_score():
+    mx = get_settings().ai_catalog_max_top_score
+    assert aic.gate(_read(), {"top_score": 0.2, "twins": True}) == "visual_candidate"
+    assert aic.gate(_read(), {"top_score": mx, "twins": False}) == "visual_candidate"
+    assert aic.gate(_read(), {"top_score": mx - 0.01, "twins": False}) is None
+    # top_score desconocido (salida manual temprana) no basta por sí solo
+    assert aic.gate(_read(), {"top_score": 0.0}) is None
+    assert aic.gate(_read(confidence="medio"), {"top_score": 0.0}) == "low_confidence"
+
+
+def test_normalize_key_stable():
+    a = aic.normalize_key("Mini GT", "Nissan Skyline", "Azúl", "#23", "Bayside, Blue")
+    b = aic.normalize_key("mini gt", "skyline nissan", "AZUL", "23", "blue bayside")
+    assert a == b and a == " ".join(sorted(a.split()))
+    assert "ú" not in a and "#" not in a
+
+
+def test_toy_number_uses_scraper_id():
+    sid = aic.make_source_id(_read(toy_number="MGT00692"))
+    assert sid == "minigt-MGT00692"
+    assert aic.piece_id(sid) == str(_uuid.uuid5(_NSID, "minigt-MGT00692"))
+    assert aic.make_source_id(_read(toy_number="692")) == "minigt-MGT00692"
+    sid2 = aic.make_source_id(_read())
+    assert sid2.startswith("ai-minigt-") and len(sid2) == len("ai-minigt-") + 12
+    assert sid2 == aic.make_source_id(_read(livery="blue bayside"))
+
+
+def test_find_duplicate_by_id_and_toy(aienv):
+    r = _read(toy_number="MGT00100")
+    _seed_variant()
+    d = aic.find_duplicate(_db, r, None)
+    assert d and d["id"] == "exist1" and d["created"] is False
+    assert d["item_master"]["name"] == "Nissan Skyline GT-R R34"
+
+
+def test_find_duplicate_by_text_returns_existing(aienv):
+    _seed_variant(toy="MGT09999")
+    aienv["text"] = [_vm("exist1", "Nissan Skyline GT-R R34 Bayside Blue", 0.9)]
+    d = aic.find_duplicate(_db, _read(), None)
+    assert d and d["id"] == "exist1"
+
+
+def test_find_duplicate_text_twin_livery_not_dup(aienv):
+    _seed_variant(toy="MGT09999", variant_name="Midnight Purple")
+    aienv["text"] = [_vm("exist1", "Nissan Skyline GT-R R34 Midnight Purple", 0.9)]
+    assert aic.find_duplicate(_db, _read(), None) is None
+    # candidato textual sin variante real en Mongo: no cuenta
+    aienv["text"] = [_vm("ghost", "Nissan Skyline GT-R R34 Bayside Blue", 0.9)]
+    assert aic.find_duplicate(_db, _read(), None) is None
+
+
+def test_find_duplicate_by_embedding_returns_existing(aienv):
+    _seed_variant(toy="MGT09999")
+    aienv["match"] = [_vis.VisionMatch(id="exist1", toy=None, name="x", score=0.91, source="embed")]
+    d = aic.find_duplicate(_db, _read(livery="otra", casting="Otro Coche"), [0.1] * 768)
+    assert d and d["id"] == "exist1"
+    aienv["match"] = [_vis.VisionMatch(id="exist1", toy=None, name="x", score=0.89, source="embed")]
+    assert aic.find_duplicate(_db, _read(livery="otra", casting="Otro Coche"), [0.1] * 768) is None
+    # sin recorte no se consulta el índice visual
+    aienv["match"] = [_vis.VisionMatch(id="exist1", toy=None, name="x", score=0.99, source="embed")]
+    assert aic.find_duplicate(_db, _read(livery="otra", casting="Otro Coche"), None) is None
+
+
+def test_create_from_read_fields_and_live_index(aienv):
+    out = aic.create_from_read(_db, "u1", _read(toy_number="MGT00692", dorsal="23"), PHOTO)
+    assert out["created"] is True
+    assert out["id"] == aic.piece_id("minigt-MGT00692")
+    doc = _db.variants.find_one({"_id": out["id"]})
+    assert doc["origin"] == "ai" and doc["verified"] is False and doc["created_by"] == "u1"
+    assert doc["source_confidence"] == "alto" and doc["confirmed_by"] == []
+    assert doc["ai_local_hash"] and doc["toy_number"] == "MGT00692"
+    assert doc["livery_number"] == "23" and doc["body_color"] == "azul"
+    assert out["main_image_url"].startswith("/api/v1/uploads/") and out["images"] == [out["main_image_url"]]
+    assert out["item_master"]["manufacturer"] == "Mini GT"
+    _IVO(**out)  # contrato de la app intacto
+    views = sorted(e["view"] for e, _ in aienv["appends"])
+    assert views == [0, 20]
+    assert all(e["id"] == out["id"] for e, _ in aienv["appends"])
+    v20 = [v for e, v in aienv["appends"] if e["view"] == 20][0]
+    assert v20[0] == 1.0  # el de vista 20 es el del recorte
+
+
+def test_same_piece_two_users_one_row(aienv):
+    a = aic.create_from_read(_db, "u1", _read(), PHOTO)
+    n_app = len(aienv["appends"])
+    b = aic.create_from_read(_db, "u2", _read(), PHOTO)
+    assert a["id"] == b["id"] and b["created"] is False
+    assert _db.variants.count_documents({}) == 1
+    assert len(aienv["appends"]) == n_app  # sin entradas duplicadas en el índice vivo
+    assert _db.variants.find_one({})["created_by"] == "u1"
+
+
+def test_existing_piece_not_duplicated(aienv):
+    _seed_variant(toy="MGT09999")
+    aienv["text"] = [_vm("exist1", "Nissan Skyline GT-R R34 Bayside Blue", 0.9)]
+    out = aic.create_from_read(_db, "u1", _read(), PHOTO)
+    assert out["id"] == "exist1" and out["created"] is False
+    assert _db.variants.count_documents({}) == 1 and aienv["appends"] == []
+
+
+def test_year_and_series_null_when_not_read(aienv):
+    out = aic.create_from_read(_db, "u1", _read(), PHOTO)
+    doc = _db.variants.find_one({"_id": out["id"]})
+    m = _db.items.find_one({"_id": as_oid(doc["item_master_id"])})
+    assert m["release_year"] == 0
+    assert doc["metadata"].get("year") is None and doc["metadata"].get("series") is None
+    out2 = aic.create_from_read(_db, "u1", _read(casting="Honda NSX", year=2024, serie="Mijo"), PHOTO)
+    d2 = _db.variants.find_one({"_id": out2["id"]})
+    assert d2["metadata"]["year"] == 2024 and d2["metadata"]["series"] == "Mijo"
+    assert out2["item_master"]["release_year"] == 2024
+    out3 = aic.create_from_read(_db, "u1", _read(casting="Mazda RX7", year=1890), PHOTO)
+    assert out3["item_master"]["release_year"] == 0
+    assert _db.variants.find_one({"_id": out3["id"]})["metadata"].get("year") is None
+
+
+def as_oid(v):
+    from app.db import as_id
+    return as_id(v)
+
+
+def test_image_is_crop_or_none(aienv):
+    out = aic.create_from_read(_db, "u1", _read(), PHOTO)
+    saved = list(_upl.UPLOAD_DIR.iterdir())
+    assert len(saved) == 1
+    with _Image.open(saved[0]) as im:
+        assert im.size == (32, 32)  # el recorte, nunca la foto cruda (64x48)
+    aienv["seg"] = None
+    aienv["appends"].clear()
+    out2 = aic.create_from_read(_db, "u1", _read(casting="Honda NSX"), PHOTO)
+    assert out2["main_image_url"] is None and out2["images"] == []
+    assert [e["view"] for e, _ in aienv["appends"]] == [0]
+    assert len(list(_upl.UPLOAD_DIR.iterdir())) == 1
+
+
+def test_daily_cap_blocks_11th(aienv, monkeypatch):
+    monkeypatch.setattr(get_settings(), "ai_catalog_daily_cap", 10)
+    for _ in range(10):
+        assert aic.daily_cap_reached(_db, "u1") is False
+        aic.consume_daily(_db, "u1")
+    assert aic.daily_cap_reached(_db, "u1") is True
+    assert aic.daily_cap_reached(_db, "u2") is False
+    d = _db.ai_catalog_usage.find_one({"user_id": "u1"})
+    assert d["day"] == _subs.today_key() and d["count"] == 10
+
+
+def test_strip_internal_removes_flags(aienv):
+    out = aic.create_from_read(_db, "u1", _read(), PHOTO)
+    s = aic.strip_internal(dict(out, hidden=False))
+    for k in ("origin", "verified", "source_confidence", "confirmed_by", "created_by", "hidden", "created"):
+        assert k not in s
+    assert s["ai_local_hash"] and s["id"] == out["id"]
+    assert "origin" in out  # no muta la entrada
+
+
+def test_upsert_extraction_keeps_create_catalog_item_behavior():
+    for coll in ("variants", "items"):
+        _db[coll].delete_many({})
+    master = {"name": "Datsun 510", "manufacturer": "Mini GT", "release_year": 2026, "category_id": "0",
+              "brand_id": None, "series_id": None, "casting_name": None, "designer": None, "scale": "1:64"}
+    variant = {"id": "manual-1", "variant_name": "Std", "toy_number": "T1", "metadata": {}}
+    v, m = _catr.upsert_catalog_piece(_db, dict(master), dict(variant), "u9")
+    assert v["_id"] == "manual-1" and v["created_by"] == "u9" and v["user_submitted"] is True
+    assert m["name"] == "Datsun 510" and "brand_id" not in m
+    assert v["ai_local_hash"] == "hash-t1"
+    # dedup por toy_number + variant_name → misma fila
+    v2, _ = _catr.upsert_catalog_piece(_db, dict(master), dict(variant, id="manual-2"), "u8")
+    assert v2["_id"] == "manual-1" and _db.variants.count_documents({}) == 1
+    # mismo id sin dedup → 409 como antes
+    from fastapi import HTTPException as _HE
+    with pytest.raises(_HE) as ei:
+        _catr.upsert_catalog_piece(_db, dict(master), dict(variant, toy_number="T2"), "u8")
+    assert ei.value.status_code == 409
