@@ -3399,3 +3399,42 @@ def test_m1_cached_retry_reapplies_identity_check(rn, aienv, clk, monkeypatch):
     assert len(rn["calls"]) == 1 and _ai_calls() == 2
     assert _is_manual(j) and _rows() == 0  # sin ancla tras quitar el texto en conflicto: no_anchor
     assert _db.identify_receipts.find_one({})["ai_tried"] is True
+
+
+# M2: alta o duplicado que terminan con el reloj vencido (la app ya se rindió):
+# la pieza se conserva, pero el recibo NO se borra (el reintento la encuentra).
+
+
+def test_m2_late_create_keeps_receipt_and_retry_finds_piece(rn, aienv, clk, monkeypatch):
+    _slow(clk, monkeypatch, "prepare_image", 9.0)
+    _slow(clk, monkeypatch, "check_duplicate", 0.5)  # create_new arranca a t0 + 9.5 (quedan 3.5 s)
+    _slow(clk, monkeypatch, "create_new", 4.0)  # y termina a t0 + 13.5: la app ya se rindió
+    _receipt()
+    _post()
+    assert _rows() == 1  # la pieza se conserva
+    assert _db.ai_catalog_usage.find_one({"user_id": "u1"})["count"] == 1  # el tope se cuenta
+    rec = _db.identify_receipts.find_one({})
+    assert rec is not None and not rec.get("ai_tried")
+    reads, calls = len(rn["calls"]), _ai_calls()
+    j = _post().json()  # reintento de la app: duplicado sin pagar de nuevo
+    assert j["method"] == "o" and _rows() == 1
+    assert len(rn["calls"]) == reads and _ai_calls() == calls
+    assert _db.ai_catalog_usage.find_one({"user_id": "u1"})["count"] == 1
+    assert _db.identify_receipts.count_documents({}) == 0
+
+
+def test_m2_late_duplicate_keeps_receipt(rn, aienv, clk, monkeypatch):
+    aic.create_from_read(_db, "u2", _read(), PHOTO)  # la pieza ya existe
+    _slow(clk, monkeypatch, "check_duplicate", 14.0)  # el duplicado llega pasado el reloj
+    _receipt()
+    _post()
+    rec = _db.identify_receipts.find_one({})
+    assert rec is not None and not rec.get("ai_tried")
+    assert not (_db.ai_catalog_usage.find_one({"user_id": "u1"}) or {}).get("count")
+
+
+def test_m2_in_time_create_still_consumes_receipt(rn, aienv, clk, monkeypatch):
+    _slow(clk, monkeypatch, "create_new", 1.0)
+    _receipt()
+    assert _post().json()["method"] == "o"
+    assert _db.identify_receipts.count_documents({}) == 0

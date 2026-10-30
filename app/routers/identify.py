@@ -1457,11 +1457,17 @@ async def _create_piece(
     except Exception:  # noqa: BLE001
         _log.warning("ai_catalog: alta fallida user=%s", uid, exc_info=True)
         return "uncertain:error", None
-    return await asyncio.to_thread(_finish_piece, db, uid, piece, receipt)
+    return await asyncio.to_thread(_finish_piece, db, uid, piece, receipt, total_deadline)
 
 
-def _finish_piece(db, uid: str, piece: dict, receipt: dict) -> tuple[str, dict | None]:
-    """Contabilidad tras el alta (tope de altas, recibo) y respuesta sin campos internos."""
+def _finish_piece(
+    db, uid: str, piece: dict, receipt: dict, total_deadline: float | None = None
+) -> tuple[str, dict | None]:
+    """Contabilidad tras el alta (tope de altas, recibo) y respuesta sin campos internos.
+
+    Si el reloj (`total_deadline`) ya venció, la app se rindió sin ver la pieza:
+    la pieza y el tope se conservan, pero el recibo queda intacto (sin borrar ni
+    marcar) para que el reintento la encuentre como duplicado sin pagar (caché)."""
     outcome = piece.get("outcome")
     if outcome not in ("created", "duplicate"):
         return f"uncertain:{piece.get('reason') or 'unknown'}", None
@@ -1471,6 +1477,9 @@ def _finish_piece(db, uid: str, piece: dict, receipt: dict) -> tuple[str, dict |
             ai_catalog.consume_daily(db, uid)
         except Exception:  # noqa: BLE001
             _log.warning("ai_catalog: no se pudo contar el alta user=%s", uid, exc_info=True)
+    if total_deadline is not None and _mono() > total_deadline:
+        print(f"[ai-catalog] {outcome} tardío: el recibo se conserva", flush=True)
+        return outcome, ai_catalog.strip_internal(piece)
     try:
         # Un escaneo sirve para una sola pieza: sin repetición para gastar llamadas.
         db.identify_receipts.delete_many({"user_id": uid, "image_hash": receipt.get("image_hash")})
