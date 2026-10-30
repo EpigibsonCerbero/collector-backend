@@ -102,3 +102,140 @@ def test_indexes_declared():
     assert any(o.get("expireAfterSeconds") == ttl for _, o in r)
     u = dbmod.INDEXES["ai_catalog_usage"]
     assert any(o.get("unique") for _, o in u)
+
+
+# ---------------------------------------------------------------- Task 2
+import json as _json
+
+from app.services import claude_vision as cv
+
+
+class _Resp:
+    def __init__(self, status=200, body=None, text=None):
+        self.status_code = status
+        self._body = body
+        self.text = text if text is not None else _json.dumps(body or {})
+
+    def json(self):
+        return self._body
+
+
+def _ok(payload):
+    return _Resp(200, {"content": [{"type": "text", "text": _json.dumps(payload)}]})
+
+
+@pytest.fixture
+def cvenv(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key-for-tests")
+    monkeypatch.setattr(cv, "_prepare", lambda b: ("b64", "image/jpeg"))
+    cv._cache.clear()
+    cv._cat_cache.clear()
+    cv._breaker_reset()
+    calls = []
+    state = {"resp": _ok({})}
+
+    def post(*a, **k):
+        calls.append(k)
+        return state["resp"]
+
+    monkeypatch.setattr(cv.requests, "post", post)
+    yield calls, state
+    cv._breaker_reset()
+
+
+def test_read_for_catalog_parses_json(cvenv):
+    calls, st = cvenv
+    st["resp"] = _ok({"es_diecast": True, "brand": "Mini GT", "casting": "Skyline",
+                      "color": "azul", "year": 1999, "confidence": "alto"})
+    r = cv.read_for_catalog(b"img1")
+    assert r["es_diecast"] is True and r["brand"] == "Mini GT" and r["year"] == 1999
+    assert r["confidence"] == "alto" and r["modelo"] is None and r["toy_number"] is None
+    body = calls[0]["json"]
+    assert body["temperature"] == 0 and body["max_tokens"] >= 600
+    txt = body["messages"][0]["content"][1]["text"]
+    assert "nunca inventes" in txt
+    cv.read_for_catalog(b"img1")
+    assert len(calls) == 1  # caché
+
+
+def test_read_for_catalog_none_without_key(cvenv, monkeypatch):
+    calls, _ = cvenv
+    monkeypatch.delenv("ANTHROPIC_API_KEY")
+    assert cv.read_for_catalog(b"img2") is None
+    assert calls == []
+
+
+def test_year_not_in_image_is_null(cvenv):
+    _, st = cvenv
+    st["resp"] = _ok({"es_diecast": True, "brand": "Hot Wheels", "year": None,
+                      "texto": "Copyright 1999"})
+    assert cv.read_for_catalog(b"img3")["year"] is None
+    st["resp"] = _ok({"es_diecast": True, "year": "1999"})
+    assert cv.read_for_catalog(b"img3b")["year"] is None
+
+
+def test_confidence_coerced(cvenv):
+    _, st = cvenv
+    st["resp"] = _ok({"es_diecast": True, "confidence": "altísimo"})
+    assert cv.read_for_catalog(b"img4")["confidence"] == "bajo"
+
+
+def test_failures_not_cached_and_unparseable_none(cvenv):
+    calls, st = cvenv
+    st["resp"] = _Resp(500, {}, "boom")
+    assert cv.read_for_catalog(b"img5") is None
+    st["resp"] = _Resp(200, {"content": [{"type": "text", "text": "sin json"}]})
+    assert cv.read_for_catalog(b"img5") is None
+    assert len(calls) == 2
+
+
+def test_breaker_opens_on_credit_error_and_stops_calls(cvenv):
+    calls, st = cvenv
+    st["resp"] = _Resp(400, {}, '{"error":{"message":"Your credit balance is too low"}}')
+    assert cv.read_for_catalog(b"a") is None
+    assert cv.breaker_open() is True
+    assert len(calls) == 1
+    assert cv.read_for_catalog(b"b") is None
+    assert cv.read_packaging_with_claude(b"c") is None
+    assert len(calls) == 1
+
+
+def test_breaker_opens_from_packaging_on_401(cvenv):
+    calls, st = cvenv
+    st["resp"] = _Resp(401, {}, "unauthorized")
+    assert cv.read_packaging_with_claude(b"p") is None
+    assert cv.breaker_open() is True
+    assert cv.read_for_catalog(b"q") is None
+    assert len(calls) == 1
+
+
+def test_breaker_not_opened_by_other_400(cvenv):
+    _, st = cvenv
+    st["resp"] = _Resp(400, {}, "invalid image")
+    cv.read_for_catalog(b"z")
+    assert cv.breaker_open() is False
+
+
+def test_breaker_closes_after_window(cvenv, monkeypatch):
+    calls, st = cvenv
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(cv, "_now", lambda: clock["t"])
+    st["resp"] = _Resp(403, {}, "forbidden")
+    cv.read_for_catalog(b"a")
+    assert cv.breaker_open() is True
+    clock["t"] += 299
+    assert cv.breaker_open() is True
+    clock["t"] += 2
+    assert cv.breaker_open() is False
+    st["resp"] = _ok({"es_diecast": True})
+    assert cv.read_for_catalog(b"b") is not None
+    assert len(calls) == 2
+
+
+def test_breaker_logs_once(cvenv, capsys):
+    _, st = cvenv
+    st["resp"] = _Resp(401, {}, "x")
+    cv.read_for_catalog(b"a")
+    cv.read_for_catalog(b"b")
+    cv.read_packaging_with_claude(b"c")
+    assert capsys.readouterr().out.count("breaker abierto") == 1
