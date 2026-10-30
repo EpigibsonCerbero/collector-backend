@@ -2041,3 +2041,63 @@ def test_reconcile_apply_hides_ai_row_only(hid, capsys):
     assert "hidden" not in _db.variants.find_one({"_id": "aiB"})
     assert _db.variants.count_documents({}) == n  # nunca borra
     assert rev.find_reconcilable(_db) == []
+
+
+# ── Revisión final (menores) ───────────────────────────────────────────────
+
+
+def test_live_corrupt_file_is_set_aside_not_overwritten(vidx, capsys):
+    (vidx / "live.json").write_text("{not json", encoding="utf-8")
+    assert len(_vis.get_index()[0]) == 30
+    assert len(_vis.get_index()[0]) == 30
+    aside = [p for p in vidx.iterdir() if p.name.startswith("live.json.corrupt-")]
+    assert len(aside) == 1 and aside[0].read_text() == "{not json"
+    assert capsys.readouterr().out.count("índice vivo ilegible") == 1
+    _vis.live_index_append(_entry(8), _unit(1008).tolist())
+    assert aside[0].read_text() == "{not json"  # la copia apartada sigue intacta
+    assert _vis.match_embedding(_unit(1008))[0].id == "live8"
+
+
+def test_live_append_fsyncs_before_replace(vidx, monkeypatch):
+    order = []
+    real_fsync, real_replace = _vis.os.fsync, _vis.os.replace
+    monkeypatch.setattr(_vis.os, "fsync", lambda fd: (order.append("fsync"), real_fsync(fd))[1])
+    monkeypatch.setattr(_vis.os, "replace", lambda a, b: (order.append("replace"), real_replace(a, b))[1])
+    _vis.live_index_append(_entry(9), _unit(1009).tolist())
+    assert order == ["fsync", "replace"]
+
+
+@pytest.mark.parametrize("status", [429, 529])
+def test_breaker_opens_briefly_on_overload(cvenv, monkeypatch, status):
+    calls, st = cvenv
+    clock = {"t": 5000.0}
+    monkeypatch.setattr(cv, "_now", lambda: clock["t"])
+    st["resp"] = _Resp(status, {}, "overloaded")
+    assert cv.read_for_catalog(b"o1") is None
+    assert cv.breaker_open() is True
+    assert cv.read_for_catalog(b"o2") is None and len(calls) == 1
+    clock["t"] += 61
+    assert cv.breaker_open() is False
+
+
+def test_adapter_keeps_dorsal_without_livery_or_color(cvenv):
+    _, st = cvenv
+    st["resp"] = _ok({"es_diecast": True, "brand": "Mini GT", "casting": "Skyline", "dorsal": "23"})
+    assert cv.read_packaging_with_claude(b"d1")["variant"] == "23"
+
+
+def test_live_corrupt_file_not_overwritten_when_it_cannot_be_moved(vidx, monkeypatch):
+    (vidx / "live.json").write_text("{not json", encoding="utf-8")
+    real_replace = _vis.os.replace
+
+    def no_move(a, b):
+        if ".corrupt-" in str(b):
+            raise OSError("read-only")
+        return real_replace(a, b)
+
+    monkeypatch.setattr(_vis.os, "replace", no_move)
+    monkeypatch.setattr(_vis, "_live_blocked", {})
+    assert len(_vis.get_index()[0]) == 30  # el identify no se rompe
+    with pytest.raises(OSError):
+        _vis.live_index_append(_entry(10), _unit(1010).tolist())
+    assert (vidx / "live.json").read_text() == "{not json"

@@ -200,6 +200,8 @@ _live_mat: np.ndarray | None = None
 _live_sig: tuple | None = None
 _live_version = 0
 _merged: tuple | None = None  # (id(grande), live_version, entries, matrix)
+# Archivo vivo ilegible que no se pudo apartar: el alta no lo pisa.
+_live_blocked: dict = {}
 
 
 def _live_path() -> Path:
@@ -243,8 +245,18 @@ def _live_refresh() -> None:
             try:
                 meta, mat = _read_live_file(path)
             except Exception as exc:  # noqa: BLE001
-                print(f"[vision] índice vivo ilegible, se ignora: {exc}", flush=True)
+                # Se aparta (nunca se pisa en silencio con el próximo alta) y
+                # se empieza de cero.
+                aside = path.with_name(f"{path.name}.corrupt-{int(time.time())}")
+                try:
+                    os.replace(path, aside)
+                    print(f"[vision] índice vivo ilegible ({type(exc).__name__}), apartado en {aside.name}", flush=True)
+                except OSError:
+                    # No se pudo apartar: se ignora y el alta se niega a pisarlo.
+                    print(f"[vision] índice vivo ilegible ({type(exc).__name__}) y no se pudo apartar", flush=True)
+                    _live_blocked["path"] = str(path)
                 meta, mat = [], None
+                sig = _index_signature([path])
         _live_meta, _live_mat, _live_sig = meta, mat, sig
         _live_version += 1
         _merged = None
@@ -289,6 +301,8 @@ def live_index_append(entry: dict, vec: list[float]) -> None:
     path = _live_path()
     with _live_lock:
         _live_refresh()  # no pisar lo que haya escrito otro worker
+        if _live_blocked.get("path") == str(path) and path.exists():
+            raise OSError("índice vivo ilegible sin apartar: no se sobrescribe")
         cur = _live_mat if _live_mat is not None else np.zeros((0, v.shape[0]), dtype=np.float32)
         new_meta = _live_meta + [meta_row]
         new_mat = np.concatenate([cur, v[None, :]], axis=0)
@@ -296,7 +310,10 @@ def live_index_append(entry: dict, vec: list[float]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
         try:
-            tmp.write_text(json.dumps(rows, ensure_ascii=False), encoding="utf-8")
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps(rows, ensure_ascii=False))
+                fh.flush()
+                os.fsync(fh.fileno())
             os.replace(tmp, path)
         except BaseException:
             try:

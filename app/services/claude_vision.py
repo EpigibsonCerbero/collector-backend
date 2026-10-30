@@ -72,18 +72,28 @@ def breaker_open() -> bool:
         return True
 
 
+# Sobrecarga / límite de ritmo (429, 529): corte breve, no el largo de saldo.
+_OVERLOAD_BREAKER_S = 60.0
+
+
 def _trip_if_fatal(status: int, text: str) -> None:
-    """Abre el corte ante saldo agotado (400 credit balance) o clave rechazada."""
+    """Abre el corte ante saldo agotado (400 credit balance) o clave rechazada
+    (`_BREAKER_S`), y brevemente ante 429/529 (`_OVERLOAD_BREAKER_S`)."""
     global _breaker_until, _breaker_opened
     fatal = status in (401, 403) or (status == 400 and "credit balance" in (text or "").lower())
-    if not fatal:
+    if fatal:
+        window = _BREAKER_S
+    elif status in (429, 529):
+        window = _OVERLOAD_BREAKER_S
+    else:
         return
     with _breaker_lock:
         already = _breaker_opened and _now() < _breaker_until
-        _breaker_until = _now() + _BREAKER_S
+        # Nunca acorta un corte más largo ya abierto.
+        _breaker_until = max(_breaker_until if already else 0.0, _now() + window)
         _breaker_opened = True
     if not already:
-        print(f"[claude] breaker abierto {int(_BREAKER_S)}s tras HTTP {status}", flush=True)
+        print(f"[claude] breaker abierto {int(window)}s tras HTTP {status}", flush=True)
 
 
 def _prepare(image_bytes: bytes) -> tuple[str, str]:
@@ -200,9 +210,8 @@ def read_packaging_with_claude(image_bytes: bytes) -> dict | None:
     read = read_for_catalog(image_bytes, timeout_s=_TIMEOUT_S)
     if not read or not read.get("es_diecast"):
         return None
-    variant = read.get("livery") or read.get("color")
-    if variant and read.get("dorsal"):
-        variant = f"{variant} {read['dorsal']}"
+    # El dorsal se conserva aunque no haya livery ni color.
+    variant = " ".join(filter(None, [read.get("livery") or read.get("color"), read.get("dorsal")])) or None
     return {
         "brand": read.get("brand"),
         "model": read.get("modelo") or read.get("casting"),
