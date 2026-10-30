@@ -342,6 +342,8 @@ def _learn_omit(model: str, keys: set[str]) -> None:
 # mínimo que debe quedar hasta el `deadline` para lanzar una petición.
 _MAX_ATTEMPTS = int(os.environ.get("CLAUDE_MAX_ATTEMPTS", "2"))
 _MIN_RETRY_S = float(os.environ.get("CLAUDE_MIN_RETRY_S", "1.0"))
+# Con deadline: tope del tiempo de conexión (la lectura usa lo que quede).
+_CONNECT_S = 2.0
 
 
 def _call(
@@ -413,7 +415,12 @@ def _call(
         while True:
             attempts += 1
             left = _left()
-            req_timeout = timeout_s if left is None else min(timeout_s, left)
+            if left is None:
+                req_timeout = timeout_s
+            else:
+                # (conexión, lectura): conectar nunca se come el presupuesto entero.
+                read_s = min(timeout_s, left)
+                req_timeout = (min(_CONNECT_S, read_s), read_s)
             r = requests.post(
                 _URL,
                 headers=_headers(api_key, cfg["speed"] if "speed" in body else "standard"),
@@ -447,7 +454,10 @@ def _call(
         if r.status_code != 200:
             _trip_if_fatal(r.status_code, r.text)
             info["error"] = r.text[:300]
-            _log_verbose(f"[claude] ← {purpose} HTTP {r.status_code} {elapsed_ms}ms body={r.text[:200]}")
+            # Sin el cuerpo del proveedor en el log: solo estado, tiempo y longitud.
+            _log_verbose(
+                f"[claude] ← {purpose} HTTP {r.status_code} {elapsed_ms}ms body_len={len(r.text or '')}"
+            )
             _record_call(info)
             return None, info
 

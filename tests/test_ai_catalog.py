@@ -2710,7 +2710,7 @@ def test_p1_call_retry_trimmed_to_deadline_and_skipped_under_1s(cvenv, clk, monk
     queue += [_Resp(400, _STYLE_ERRS[1])]
     out, _ = cv._call(b"x", "p", 100, 12.0, cv.CallOpts(model="m-d1"), "t", deadline=clk["t"] + 5.0)
     assert out is not None
-    assert [c["timeout"] for c in calls] == [5.0, 2.0]  # min(timeout, restante)
+    assert [c["timeout"] for c in calls] == [(2.0, 5.0), (2.0, 2.0)]  # (conexión, min(timeout, restante))
     calls.clear()
     cv._style_omit.clear()
     queue += [_Resp(400, _STYLE_ERRS[1])]
@@ -2947,3 +2947,35 @@ def test_p7_not_foto_real_log_has_no_detalle(rn, monkeypatch, capsys):
     _post()
     out = capsys.readouterr().out
     assert "not_foto_real" in out and "MODEL-RAW-DETAIL" not in out and "detalle_len=16" in out
+
+
+# Q3: con deadline, el tiempo de conexión queda acotado (conexión, lectura).
+
+
+def test_q3_deadline_uses_connect_read_tuple(cvenv, clk):
+    calls, _st = cvenv
+    cv._call(b"x", "p", 100, 12.0, cv.CallOpts(model="m-q3a"), "t", deadline=clk["t"] + 5.0)
+    assert calls[-1]["timeout"] == (2.0, 5.0)
+    cv._call(b"x", "p", 100, 12.0, cv.CallOpts(model="m-q3b"), "t", deadline=clk["t"] + 1.5)
+    assert calls[-1]["timeout"] == (1.5, 1.5)
+
+
+def test_q3_no_deadline_keeps_float_timeout(cvenv):
+    calls, _st = cvenv
+    cv._call(b"x", "p", 100, 4.5, cv.CallOpts(model="m-q3c"), "t")
+    assert calls[-1]["timeout"] == 4.5 and isinstance(calls[-1]["timeout"], float)
+
+
+# Q4: el log del error del proveedor no lleva su cuerpo.
+
+
+def test_q4_error_log_has_status_ms_and_length_only(cvenv, monkeypatch, capsys):
+    calls, st = cvenv
+    monkeypatch.setattr(cv, "_VERBOSE", True)
+    secret = "PROVIDER-BODY-SECRET"
+    st["resp"] = _Resp(500, None, text=f"internal {secret}")
+    out, info = cv._call(b"x", "p", 100, 4.5, cv.CallOpts(model="m-q4"), "t")
+    assert out is None and secret in info["error"]  # interno: se mantiene
+    log = capsys.readouterr().out
+    line = [l for l in log.splitlines() if "HTTP 500" in l][0]
+    assert secret not in log and "body_len=" in line and "ms" in line
