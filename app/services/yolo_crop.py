@@ -83,6 +83,51 @@ def _get_yolo():
     return _model
 
 
+# Recarga en segundo plano (tras un fallo de arranque): un solo hilo a la vez
+# y como máximo un intento por ventana de `_NEG_TTL_S`.
+_bg_lock = threading.Lock()
+_bg_running = False
+_bg_next_at = 0.0
+
+
+def _spawn(target) -> threading.Thread:
+    t = threading.Thread(target=target, name="yolo-reload", daemon=True)
+    t.start()
+    return t
+
+
+def ensure_loading_in_background() -> threading.Thread | None:
+    """Sin modelo en memoria y con la caché negativa vencida: lanza UN intento
+    de carga en un hilo daemon y vuelve enseguida (nunca carga en el hilo del
+    llamador). None si no se lanzó nada."""
+    global _bg_running, _bg_next_at
+    if _model is not None:
+        return None
+    with _bg_lock:
+        now = _clock()
+        if _bg_running or _neg_active() or now < _bg_next_at:
+            return None
+        _bg_running = True
+        _bg_next_at = now + _NEG_TTL_S
+
+    def run() -> None:
+        global _bg_running
+        try:
+            _get_yolo()
+        except Exception:  # noqa: BLE001
+            pass  # `_fail` ya abrió la caché negativa y lo registró
+        finally:
+            with _bg_lock:
+                _bg_running = False
+
+    try:
+        return _spawn(run)
+    except Exception:  # noqa: BLE001
+        with _bg_lock:
+            _bg_running = False
+        return None
+
+
 def warmup() -> None:
     """Carga al arrancar (fuera de cualquier cupo del identify). Nunca lanza."""
     try:

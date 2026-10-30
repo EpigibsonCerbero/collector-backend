@@ -675,10 +675,14 @@ def prepare_image(image_bytes: bytes) -> Prepared:
     crop_vec = dinov2_embed.embed_image(crop) if crop is not None else None
     # Esto corre bajo `_IDENTIFY_SLOTS`: si YOLO aún no está en memoria (lo
     # precalienta `vision.warmup`), no se carga aquí; sin comprobación no hay
-    # foto publicada.
+    # foto publicada. Tras un fallo de arranque se lanza un intento de carga
+    # en segundo plano (fuera de esta petición) para las siguientes.
     from app.services import yolo_crop
 
-    publishable = crop is not None and yolo_crop.loaded() and _crop_is_car(im, seg)
+    was_loaded = yolo_crop.loaded()
+    if not was_loaded and get_settings().ai_catalog_enabled:
+        yolo_crop.ensure_loading_in_background()
+    publishable = crop is not None and was_loaded and _crop_is_car(im, seg)
     return Prepared(im=im, crop=crop, crop_vec=crop_vec, publishable=publishable)
 
 

@@ -2892,7 +2892,10 @@ def test_p3_loaded_detects_as_today(yolo_env, monkeypatch):
 
 def test_p3_prepare_image_skips_check_when_model_not_loaded(aienv, monkeypatch):
     monkeypatch.setattr(_yolo, "loaded", lambda: False)
+    bg = []  # Q2: la recarga va a segundo plano (aquí simulada: sin hilos ni modelos reales)
+    monkeypatch.setattr(_yolo, "ensure_loading_in_background", lambda: bg.append(1))
     prep = aic.prepare_image(PHOTO)
+    assert bg == [1]
     assert prep.publishable is False and aienv["yolo_calls"] == 0
     out = aic.create_from_read(_db, "u1", _read(), PHOTO)
     assert out["outcome"] == "created" and out["main_image_url"] is None
@@ -3128,3 +3131,100 @@ def test_q5_timing_line_rejected_without_verify_or_create(rn, aienv, clk, monkey
         assert _is_manual(_post().json())
     assert _timing_lines(caplog) == ["ai_catalog timing read_ms=8000 verify_ms=- create_ms=- "
                                      "total_ms=8000 decision=rejected:no_verifier user=u1"]
+
+
+# Q2: YOLO se recupera en segundo plano tras un fallo de arranque.
+import threading as _threading
+
+_REAL_LOADED = _yolo.loaded
+
+
+@pytest.fixture
+def q2(aienv, yolo_env, monkeypatch):
+    clock, weights = yolo_env
+    weights.write_bytes(b"w")
+    monkeypatch.setattr(_yolo, "loaded", _REAL_LOADED)  # aienv lo fija a True
+    monkeypatch.setattr(_yolo, "_bg_running", False)
+    monkeypatch.setattr(_yolo, "_bg_next_at", 0.0)
+    st = {"ctor": _FakeModel, "threads": [], "ctor_threads": []}
+
+    def ctor(path):
+        st["ctor_threads"].append(_threading.current_thread())
+        return st["ctor"](path)
+
+    monkeypatch.setitem(sys.modules, "ultralytics", _FakeUltra(ctor))
+    real_spawn = _yolo._spawn
+
+    def spawn(target):
+        t = real_spawn(target)
+        st["threads"].append(t)
+        return t
+
+    monkeypatch.setattr(_yolo, "_spawn", spawn)
+    st["clock"] = clock
+    yield st
+    for t in st["threads"]:
+        t.join(5)
+
+
+def _boom(path):
+    raise RuntimeError("arranque roto")
+
+
+def test_q2_after_window_first_request_spawns_one_load(q2, aienv):
+    q2["ctor"] = _boom
+    _yolo.warmup()  # fallo al arrancar: caché negativa 600 s
+    assert not _yolo.loaded() and len(q2["ctor_threads"]) == 1
+    q2["clock"]["t"] += 300
+    assert aic.prepare_image(PHOTO).publishable is False
+    assert q2["threads"] == []  # dentro de la ventana: nada
+    q2["clock"]["t"] += 301
+    q2["ctor"] = _FakeModel
+    prep = aic.prepare_image(PHOTO)
+    assert prep.publishable is False and aienv["yolo_calls"] == 0  # esta petición sigue sin foto
+    assert len(q2["threads"]) == 1
+    q2["threads"][0].join(5)
+    assert _yolo.loaded()
+    assert q2["ctor_threads"][-1] is not _threading.main_thread()  # nunca en el hilo de la petición
+    assert aic.prepare_image(PHOTO).publishable is True and aienv["yolo_calls"] == 1
+    assert len(q2["threads"]) == 1
+
+
+def test_q2_never_loaded_spawns_and_concurrent_requests_spawn_one(q2, aienv):
+    gate = _threading.Event()
+
+    def slow(path):
+        gate.wait(5)
+        return _FakeModel(path)
+
+    q2["ctor"] = slow
+    for _ in range(3):
+        assert aic.prepare_image(PHOTO).publishable is False
+    workers = [_threading.Thread(target=aic.prepare_image, args=(PHOTO,)) for _ in range(4)]
+    for w in workers:
+        w.start()
+    for w in workers:
+        w.join(5)
+    assert len(q2["threads"]) == 1
+    gate.set()
+    q2["threads"][0].join(5)
+    assert _yolo.loaded() and len(q2["ctor_threads"]) == 1
+
+
+def test_q2_failed_background_load_waits_a_full_window(q2, aienv):
+    q2["ctor"] = _boom
+    aic.prepare_image(PHOTO)
+    q2["threads"][0].join(5)
+    assert not _yolo.loaded() and len(q2["threads"]) == 1
+    q2["clock"]["t"] += 599
+    aic.prepare_image(PHOTO)
+    assert len(q2["threads"]) == 1  # como máximo uno por ventana de 600 s
+    q2["clock"]["t"] += 2
+    aic.prepare_image(PHOTO)
+    assert len(q2["threads"]) == 2
+
+
+def test_q2_flag_off_spawns_nothing(q2, aienv, monkeypatch):
+    monkeypatch.setattr(get_settings(), "ai_catalog_enabled", False)
+    aic.prepare_image(PHOTO)
+    assert q2["threads"] == [] and q2["ctor_threads"] == [] and not _yolo.loaded()
