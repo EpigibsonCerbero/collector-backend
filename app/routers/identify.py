@@ -1210,6 +1210,15 @@ async def identify_resolve_new(
     if await asyncio.to_thread(ai_catalog.daily_cap_reached, db, uid):
         _log.info("ai_catalog cap user=%s", uid)
         return IdentifyOut()
+    # Tope de lecturas pagadas (usuario y global): se cuenta ANTES de pagar.
+    try:
+        allowed = await asyncio.to_thread(ai_catalog.reserve_ai_call, db, uid)
+    except Exception:  # noqa: BLE001
+        _log.warning("ai_catalog: no se pudo contar la lectura user=%s", uid, exc_info=True)
+        allowed = False
+    if not allowed:
+        _log.info("ai_catalog call_cap user=%s", uid)
+        return IdentifyOut()
     # La lectura espera a la red: fuera del semáforo para no frenar los identify.
     decision, read = await asyncio.to_thread(_read_and_gate, data, receipt)
     piece = None

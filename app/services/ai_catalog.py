@@ -447,6 +447,33 @@ def consume_daily(db, user_id: str) -> None:
     )
 
 
+# Contador global de lecturas pagadas (misma colección, usuario ficticio).
+GLOBAL_USAGE_ID = "__global__"
+
+
+def _bump_calls(db, user_id: str, day: str) -> int:
+    doc = db.ai_catalog_usage.find_one_and_update(
+        {"user_id": user_id, "day": day},
+        {"$inc": {"ai_calls": 1}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
+    return int((doc or {}).get("ai_calls") or 0)
+
+
+def reserve_ai_call(db, user_id: str) -> bool:
+    """Cuenta UNA lectura pagada antes de hacerla. False = tope alcanzado
+    (del usuario o global): no se llama a la IA. El incremento es atómico; al
+    pasarse, el contador queda por encima del tope (inofensivo)."""
+    from app.services.subscription import today_key
+
+    st = get_settings()
+    day = today_key()
+    if _bump_calls(db, str(user_id), day) > st.ai_catalog_daily_ai_calls:
+        return False
+    return _bump_calls(db, GLOBAL_USAGE_ID, day) <= st.ai_catalog_global_daily_calls
+
+
 # ── Alta ───────────────────────────────────────────────────────────────────
 
 

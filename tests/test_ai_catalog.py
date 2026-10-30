@@ -990,7 +990,7 @@ def test_existing_piece_returned_not_created(rn):
     assert r.status_code == 200 and j["method"] == "o" and j["needs_manual"] is False
     assert j["item"]["id"] == "exist1" and "outcome" not in j["item"]
     assert _rows() == 1
-    assert _db.ai_catalog_usage.count_documents({}) == 0  # no gasta el tope diario
+    assert _db.ai_catalog_usage.count_documents({"count": {"$gt": 0}}) == 0  # no gasta el tope de altas
     assert _db.identify_receipts.count_documents({}) == 0  # recibo consumido
 
 
@@ -1002,7 +1002,7 @@ def test_uncertain_returns_manual_keeps_receipt(rn, aienv, caplog):
     assert r.status_code == 200 and _is_manual(r.json())
     assert _rows() == 0 and aienv["appends"] == []
     assert _db.identify_receipts.count_documents({}) == 1
-    assert _db.ai_catalog_usage.count_documents({}) == 0
+    assert _db.ai_catalog_usage.count_documents({"count": {"$gt": 0}}) == 0
     assert "ai_catalog uncertain:text_search_truncated user=u1" in caplog.text
 
 
@@ -1808,3 +1808,51 @@ def test_no_ai_markers_reach_the_app(rn, gar):
     assert blobs["list"] and blobs["by_toy"]
     for name, b in blobs.items():
         assert _walk_leaks(b) == [], name
+
+
+# ── Revisión final I6: tope de LLAMADAS pagadas (usuario y global) ──────────
+
+
+def test_user_ai_call_cap_counts_rejected_reads(rn, monkeypatch):
+    monkeypatch.setattr(get_settings(), "ai_catalog_daily_ai_calls", 2)
+    rn["read"] = _read(es_diecast=False)  # rechazadas: no crean nada, pero cuestan
+    for i in range(3):
+        img = _jpeg((i, 50, 50))
+        _receipt(img=img)
+        assert _is_manual(_post(img=img).json())
+    assert len(rn["calls"]) == 2
+    d = _db.ai_catalog_usage.find_one({"user_id": "u1", "day": _subs.today_key()})
+    assert d["ai_calls"] >= 2
+    rn["who"]["id"] = "u2"  # el tope es por usuario
+    img = _jpeg((9, 9, 9))
+    _receipt(uid="u2", img=img)
+    _post(img=img)
+    assert len(rn["calls"]) == 3
+
+
+def test_retried_photo_does_not_bypass_call_cap(rn, monkeypatch):
+    monkeypatch.setattr(get_settings(), "ai_catalog_daily_ai_calls", 2)
+    rn["read"] = None  # error de la IA: el recibo no se marca y se puede reintentar
+    _receipt()
+    for _ in range(4):
+        assert _is_manual(_post().json())
+    assert len(rn["calls"]) == 2
+
+
+def test_global_ai_call_cap_is_a_kill_switch(rn, monkeypatch):
+    monkeypatch.setattr(get_settings(), "ai_catalog_global_daily_calls", 2)
+    rn["read"] = _read(es_diecast=False)
+    for i, uid in enumerate(("u1", "u2", "u3")):
+        rn["who"]["id"] = uid
+        img = _jpeg((i, 1, 1))
+        _receipt(uid=uid, img=img)
+        assert _is_manual(_post(img=img).json())
+    assert len(rn["calls"]) == 2
+    g = _db.ai_catalog_usage.find_one({"user_id": "__global__", "day": _subs.today_key()})
+    assert g["ai_calls"] >= 2
+
+
+def test_call_caps_default_values():
+    st = get_settings()
+    assert st.ai_catalog_daily_ai_calls == 30 and st.ai_catalog_global_daily_calls == 500
+    assert st.ai_catalog_daily_cap == 10  # el tope de altas sigue igual
