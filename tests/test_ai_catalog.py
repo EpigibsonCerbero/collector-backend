@@ -2510,3 +2510,36 @@ def test_resolve_new_ignores_client_style_fields(rn, monkeypatch):
     }).json()
     assert j["method"] == "o" and j.get("item") is not None
     assert seen["opts"] is None  # nada del cliente llega a la llamada
+
+
+# ── Segunda pasada de correcciones ─────────────────────────────────────────
+
+
+def test_p6_reconcile_ignores_hidden_official(hid):
+    """Una fila oficial oculta no cuenta: la de IA con ese toy# se queda visible."""
+    _p7("aiH", toy_number="MGT00710")
+    _db.variants.insert_one({"_id": "offH", "variant_name": "z", "toy_number": "MGT00710", "hidden": True})
+    assert rev.find_reconcilable(_db) == []
+    rev.reconcile(_db, apply=True)
+    assert "hidden" not in _db.variants.find_one({"_id": "aiH"})
+    # con una oficial visible además, sí se reconcilia contra la visible
+    _db.variants.insert_one({"_id": "offV", "variant_name": "v", "toy_number": "MGT00710"})
+    assert [(r["id"], r["official_id"]) for r in rev.find_reconcilable(_db)] == [("aiH", "offV")]
+
+
+def test_p5_usage_unique_index_matches_upsert_key():
+    """El upsert de consume_daily/_bump_calls filtra por (user_id, day): ese es el índice único."""
+    defs = dbmod.INDEXES["ai_catalog_usage"]
+    uniques = [keys for keys, opts in defs if opts.get("unique")]
+    assert uniques == [[("user_id", 1), ("day", 1)]]
+    _db.ai_catalog_usage.delete_many({})
+    for keys, opts in defs:
+        _db.ai_catalog_usage.create_index(keys, **opts)
+    aic.consume_daily(_db, "u1")
+    aic.reserve_ai_call(_db, "u1")
+    aic.consume_daily(_db, "u1")
+    assert _db.ai_catalog_usage.count_documents({"user_id": "u1"}) == 1
+    doc = _db.ai_catalog_usage.find_one({"user_id": "u1"})
+    assert doc["count"] == 2 and doc["ai_calls"] == 1
+    assert _db.ai_catalog_usage.count_documents({"user_id": aic.GLOBAL_USAGE_ID}) == 1
+    _db.ai_catalog_usage.delete_many({})

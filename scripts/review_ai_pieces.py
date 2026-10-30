@@ -61,13 +61,22 @@ def demote(db, piece_id: str, apply: bool = False) -> dict:
 
 def find_reconcilable(db) -> list[dict]:
     """Piezas de IA visibles cuyo `toy_number` ya tiene una pieza que no es de
-    IA (el scrape oficial la trajo después). Esas filas de IA sobran."""
+    IA (el scrape oficial la trajo después). Esas filas de IA sobran.
+
+    Una fila oficial oculta no cuenta: si no, se ocultaría también la de IA y
+    ese número desaparecería del catálogo."""
     rows = []
     for d in db.variants.find(
         {"origin": "ai", "hidden": {"$ne": True}, "toy_number": {"$nin": [None, ""]}}
     ).sort("created_at", 1):
         official = db.variants.find_one(
-            {"toy_number": d["toy_number"], "origin": {"$ne": "ai"}, "_id": {"$ne": d["_id"]}}, {"_id": 1}
+            {
+                "toy_number": d["toy_number"],
+                "origin": {"$ne": "ai"},
+                "hidden": {"$ne": True},
+                "_id": {"$ne": d["_id"]},
+            },
+            {"_id": 1},
         )
         if official:
             rows.append({"id": str(d["_id"]), "toy_number": d["toy_number"], "official_id": str(official["_id"])})
