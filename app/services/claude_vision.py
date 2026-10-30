@@ -338,6 +338,12 @@ def _learn_omit(model: str, keys: set[str]) -> None:
         _style_omit[model] = (old | frozenset(keys), _now() + _STYLE_OMIT_TTL_S)
 
 
+# Intentos por llamada (el 1º + un reintento sin el estilo rechazado) y tiempo
+# mínimo que debe quedar hasta el `deadline` para lanzar una petición.
+_MAX_ATTEMPTS = int(os.environ.get("CLAUDE_MAX_ATTEMPTS", "2"))
+_MIN_RETRY_S = float(os.environ.get("CLAUDE_MIN_RETRY_S", "1.0"))
+
+
 def _call(
     image_bytes: bytes,
     prompt: str,
@@ -345,12 +351,17 @@ def _call(
     timeout_s: float,
     opts: CallOpts | None,
     purpose: str,
+    deadline: float | None = None,
 ) -> tuple[dict | None, dict | None]:
     """POST a /v1/messages. Devuelve (json_respuesta, info_llamada). Fail-open: (None, info).
 
     Si la API rechaza un parámetro de estilo (speed/thinking/effort) por el
-    modelo elegido, se reintenta una vez sin ese parámetro: el backend degrada
-    en vez de fallar.
+    modelo elegido, se reintenta sin ese parámetro (máx. `_MAX_ATTEMPTS`
+    peticiones): el backend degrada en vez de fallar.
+
+    `deadline` (instante de `_now()`, opcional): cada petición usa
+    `min(timeout_s, restante)` y no se lanza ninguna con menos de
+    `_MIN_RETRY_S` restantes.
     """
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
@@ -388,22 +399,36 @@ def _call(
             f"max_tokens={max_tokens} img={len(image_bytes)}B prompt={len(prompt)}ch "
             f"timeout={timeout_s}s"
         )
+        def _left() -> float | None:
+            return None if deadline is None else deadline - _now()
+
+        left = _left()
+        if left is not None and left < _MIN_RETRY_S:
+            info["ms"] = int((time.perf_counter() - t0) * 1000)
+            info["error"] = "deadline"
+            _log_verbose(f"[claude] {purpose}: sin tiempo ({left:.1f}s) → se omite")
+            _record_call(info)
+            return None, info
         attempts = 0
         while True:
             attempts += 1
+            left = _left()
+            req_timeout = timeout_s if left is None else min(timeout_s, left)
             r = requests.post(
                 _URL,
                 headers=_headers(api_key, cfg["speed"] if "speed" in body else "standard"),
                 json=dict(body),
-                timeout=timeout_s,
+                timeout=req_timeout,
             )
-            if r.status_code in (400, 429) and attempts < 4:
+            left = _left()
+            can_retry = attempts < _MAX_ATTEMPTS and (left is None or left >= _MIN_RETRY_S)
+            if r.status_code in (400, 429):
                 before = {k for k in _STYLE_KEYS if k in body}
-                stripped = _strip_offending_style(body, r.text)
-                if stripped is not None:
-                    removed = before - set(stripped.keys())
-                    if r.status_code == 400:
-                        _learn_omit(cfg["model"], removed)
+                stripped = _strip_offending_style(dict(body), r.text)
+                if stripped is not None and r.status_code == 400:
+                    # Se aprende aunque no quede tiempo para reintentar.
+                    _learn_omit(cfg["model"], before - set(stripped.keys()))
+                if stripped is not None and can_retry:
                     info["degraded"] = sorted(
                         {"speed", "thinking", "output_config"} - set(stripped.keys())
                     )
@@ -474,6 +499,7 @@ def analyze(
     mode: str = DEFAULT_MODE,
     timeout_s: float | None = None,
     opts: CallOpts | None = None,
+    deadline: float | None = None,
 ) -> dict | None:
     """Identifica lo que hay en la foto con el modo dado. None si falla.
 
@@ -503,6 +529,7 @@ def analyze(
         timeout_s=spec["timeout"] if timeout_s is None else timeout_s,
         opts=opts,
         purpose=mode,
+        deadline=deadline,
     )
     if data is None:
         return None
@@ -523,12 +550,13 @@ def read_for_catalog(
     image_bytes: bytes,
     timeout_s: float | None = None,
     opts: CallOpts | None = None,
+    deadline: float | None = None,
 ) -> dict | None:
     """Lectura de grado catálogo diecast (modo `catalogo`).
 
     None sin clave, con el corte abierto, o ante error.
     """
-    raw = analyze(image_bytes, mode="catalogo", timeout_s=timeout_s, opts=opts)
+    raw = analyze(image_bytes, mode="catalogo", timeout_s=timeout_s, opts=opts, deadline=deadline)
     if raw is None:
         return None
     return _norm_catalog(raw)
@@ -575,6 +603,7 @@ def verify_real_object(
     image_bytes: bytes,
     opts: CallOpts | None = None,
     timeout_s: float | None = None,
+    deadline: float | None = None,
 ) -> dict | None:
     """Segunda opinión pericial: ¿objeto físico real y qué texto/identidad hay?
 
@@ -590,6 +619,7 @@ def verify_real_object(
         timeout_s=_GENERIC_TIMEOUT_S if timeout_s is None else timeout_s,
         opts=opts,
         purpose="verify",
+        deadline=deadline,
     )
     if data is None:
         return None

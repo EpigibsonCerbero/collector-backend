@@ -13,6 +13,7 @@ import contextvars
 import hashlib
 import io
 import logging
+import os
 import re
 import threading
 import time
@@ -1148,11 +1149,19 @@ def _valid_receipt(db, uid: str, ihash: str) -> dict | None:
     return None
 
 
-# Presupuesto del resolve-new: la app lo abandona a los 15 s. Lectura + verificación
-# caben con margen; si se pasa, se rechaza en vez de crear a ciegas.
-_RESOLVE_READ_TIMEOUT_S = 8.0
-_RESOLVE_VERIFY_TIMEOUT_S = 5.0
-_RESOLVE_BUDGET_S = 11.0
+# Presupuesto del resolve-new: la app lo abandona a los 15 s. Reloj absoluto
+# (`_mono`) desde que empieza la parte cara (reserva + lectura):
+#   · total ≤ `_RESOLVE_TOTAL_BUDGET_S`;
+#   · lectura + verificación (reintentos incluidos) comparten UN deadline de
+#     `_RESOLVE_AI_BUDGET_S`; cada llamada recibe lo que quede (mín.
+#     `_RESOLVE_MIN_TIMEOUT_S`) y no se inicia con menos de `_RESOLVE_MIN_START_S`;
+#   · el alta solo arranca si quedan ≥ `_RESOLVE_CREATE_MIN_S`.
+_RESOLVE_TOTAL_BUDGET_S = float(os.environ.get("RESOLVE_TOTAL_BUDGET_S", "13"))
+_RESOLVE_AI_BUDGET_S = float(os.environ.get("RESOLVE_AI_BUDGET_S", "8"))
+_RESOLVE_MIN_START_S = float(os.environ.get("RESOLVE_MIN_START_S", "1.5"))
+_RESOLVE_MIN_TIMEOUT_S = float(os.environ.get("RESOLVE_MIN_TIMEOUT_S", "1"))
+_RESOLVE_CREATE_MIN_S = float(os.environ.get("RESOLVE_CREATE_MIN_S", "4"))
+_mono = time.monotonic  # reloj inyectable en pruebas
 
 # Rechazo por verificador ausente: fallo transitorio, el recibo no se marca
 # `ai_tried` (un reintento puede crear). La lectura sí quedó contada.
@@ -1166,6 +1175,7 @@ def _read_and_gate(
     opts: "claude_vision.CallOpts | None" = None,
     db=None,
     uid: str | None = None,
+    ai_deadline: float | None = None,
 ) -> tuple[str | None, dict | None]:
     """(motivo de rechazo o None, lectura). Red, sin CPU: va FUERA de `_IDENTIFY_SLOTS`.
     La barrera del recibo ya pasó antes de llegar aquí (sin coste).
@@ -1173,10 +1183,20 @@ def _read_and_gate(
     La lectura y la verificación son DOS llamadas pagadas: ambas cuentan contra
     el tope (`reserve_ai_call`). Sin marca ni modelo reconocibles se rechaza;
     NO se rellena con «Desconocido».
+
+    `ai_deadline` (instante de `_mono()`): deadline compartido por las dos
+    llamadas. Por defecto, `_RESOLVE_AI_BUDGET_S` desde ahora.
     """
-    t0 = time.monotonic()
+    if ai_deadline is None:
+        ai_deadline = _mono() + _RESOLVE_AI_BUDGET_S
+    left = ai_deadline - _mono()
+    if left < _RESOLVE_MIN_START_S:
+        print("[ai-catalog] sin tiempo para la lectura", flush=True)
+        return "no_ai", None
     try:
-        read = claude_vision.read_for_catalog(data, timeout_s=_RESOLVE_READ_TIMEOUT_S, opts=opts)
+        read = claude_vision.read_for_catalog(
+            data, timeout_s=max(_RESOLVE_MIN_TIMEOUT_S, left), opts=opts, deadline=ai_deadline
+        )
     except Exception:  # noqa: BLE001
         read = None
     if read is None:
@@ -1193,9 +1213,11 @@ def _read_and_gate(
         print(f"[ai-catalog] rechazo {reason}", flush=True)
         return f"rejected:{reason}", read
     # Segunda opinión pericial (otra llamada pagada): el lector alucina en renders.
-    if time.monotonic() - t0 > _RESOLVE_BUDGET_S:
-        print("[ai-catalog] rechazo timeout (presupuesto agotado)", flush=True)
-        return "rejected:timeout", read
+    # Sin tiempo para ella = sin verificador (no se crea; no se reserva la llamada).
+    left = ai_deadline - _mono()
+    if left < _RESOLVE_MIN_START_S:
+        print(f"[ai-catalog] rechazo no_verifier (sin tiempo: {left:.1f}s)", flush=True)
+        return _NO_VERIFIER, read
     if db is not None and uid is not None:
         try:
             if not ai_catalog.reserve_ai_call(db, uid):
@@ -1205,7 +1227,12 @@ def _read_and_gate(
             return "rejected:call_cap", read
     verdict = None
     try:
-        verdict = claude_vision.verify_real_object(data, opts, timeout_s=_RESOLVE_VERIFY_TIMEOUT_S)
+        verdict = claude_vision.verify_real_object(
+            data,
+            opts,
+            timeout_s=max(_RESOLVE_MIN_TIMEOUT_S, ai_deadline - _mono()),
+            deadline=ai_deadline,
+        )
     except Exception:  # noqa: BLE001
         verdict = None
     if verdict is None:
@@ -1353,6 +1380,10 @@ async def identify_resolve_new(
     if await asyncio.to_thread(ai_catalog.daily_cap_reached, db, uid):
         _log.info("ai_catalog cap user=%s", uid)
         return IdentifyOut()
+    # Empieza la parte cara: desde aquí corre el presupuesto absoluto.
+    t0 = _mono()
+    ai_deadline = t0 + _RESOLVE_AI_BUDGET_S
+    total_deadline = t0 + _RESOLVE_TOTAL_BUDGET_S
     # Tope de lecturas pagadas (usuario y global): se cuenta ANTES de pagar.
     try:
         allowed = await asyncio.to_thread(ai_catalog.reserve_ai_call, db, uid)
@@ -1365,11 +1396,16 @@ async def identify_resolve_new(
     # La lectura espera a la red: fuera del semáforo para no frenar los identify.
     # Modelo/velocidad/pensamiento: los fija el servidor (entorno), no el cliente.
     decision, read = await asyncio.to_thread(
-        _read_and_gate, data, receipt, None, db, uid
+        _read_and_gate, data, receipt, None, db, uid, ai_deadline
     )
     piece = None
     if decision is None:
-        decision, piece = await _create_piece(db, uid, read, data, receipt)
+        if total_deadline - _mono() < _RESOLVE_CREATE_MIN_S:
+            # Sin tiempo para el alta: la app se rendiría mientras se crea.
+            print("[ai-catalog] rechazo timeout (sin presupuesto para el alta)", flush=True)
+            decision = "rejected:timeout"
+        else:
+            decision, piece = await _create_piece(db, uid, read, data, receipt)
     if read is not None and piece is None and decision not in _RETRYABLE:
         await asyncio.to_thread(_mark_ai_tried, db, receipt)
     _log.info("ai_catalog %s user=%s", decision, uid)

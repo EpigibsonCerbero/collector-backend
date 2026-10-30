@@ -2504,7 +2504,7 @@ def test_resolve_new_ignores_client_style_fields(rn, monkeypatch):
     seen = {}
     real = cv.read_for_catalog
 
-    def spy(data, timeout_s=None, opts=None):
+    def spy(data, timeout_s=None, opts=None, **_k):
         seen["opts"] = opts
         return _fp_read(texto="MOON EQUIPMENT CO., PANDEM")
 
@@ -2662,3 +2662,158 @@ def test_p4_overload_429_does_not_learn(style):
     queue += [_Resp(429, {"error": {"message": "fast mode rate limit"}}), _ok({"titulo": "a"})]
     cv.analyze(b"p4-10", mode="general", opts=cv.CallOpts(model="m-x", speed="fast", thinking="off"))
     assert cv._style_omit == {}
+
+
+# P1: presupuesto total con reloj absoluto (lectura + verificación ≤ 8 s,
+# alta solo con ≥ 4 s restantes, total ≤ 13 s). `_call` con `deadline`.
+
+_STYLE_ERRS = [
+    {"error": {"type": "invalid_request_error", "message": "does not support the `speed` parameter"}},
+    {"error": {"type": "invalid_request_error", "message": "To turn thinking off on this model, send ..."}},
+    {"error": {"type": "invalid_request_error", "message": "output_config is not supported"}},
+]
+
+
+@pytest.fixture
+def clk(monkeypatch):
+    c = {"t": 1000.0}
+    monkeypatch.setattr(cv, "_now", lambda: c["t"])
+    monkeypatch.setattr(idn, "_mono", lambda: c["t"])
+    return c
+
+
+def test_p1_call_at_most_two_attempts(cvenv, monkeypatch):
+    calls, _st = cvenv
+    queue = [_Resp(400, e) for e in _STYLE_ERRS]
+
+    def post(*a, **k):
+        calls.append(k)
+        return queue.pop(0)
+
+    monkeypatch.setattr(cv.requests, "post", post)
+    out = cv.analyze(b"p1-a", mode="general",
+                     opts=cv.CallOpts(model="m-p1", speed="fast", thinking="auto", effort="low"))
+    assert out is None and len(calls) == 2
+
+
+def test_p1_call_retry_trimmed_to_deadline_and_skipped_under_1s(cvenv, clk, monkeypatch):
+    calls, _st = cvenv
+    queue = []
+
+    def post(*a, **k):
+        calls.append(k)
+        clk["t"] += 3.0  # cada petición tarda 3 s y vuelve con un 400 de estilo
+        return queue.pop(0) if queue else _ok({"titulo": "ok"})
+
+    monkeypatch.setattr(cv.requests, "post", post)
+    queue += [_Resp(400, _STYLE_ERRS[1])]
+    out, _ = cv._call(b"x", "p", 100, 12.0, cv.CallOpts(model="m-d1"), "t", deadline=clk["t"] + 5.0)
+    assert out is not None
+    assert [c["timeout"] for c in calls] == [5.0, 2.0]  # min(timeout, restante)
+    calls.clear()
+    cv._style_omit.clear()
+    queue += [_Resp(400, _STYLE_ERRS[1])]
+    out, info = cv._call(b"x", "p", 100, 12.0, cv.CallOpts(model="m-d2"), "t", deadline=clk["t"] + 3.5)
+    assert out is None and len(calls) == 1  # quedaban 0.5 s: un 400 no multiplica el tiempo
+    assert info["http_status"] == 400
+
+
+def test_p1_call_without_deadline_keeps_timeout(cvenv):
+    calls, _st = cvenv
+    cv._call(b"x", "p", 100, 4.5, cv.CallOpts(model="m-nd"), "t")
+    assert [c["timeout"] for c in calls] == [4.5]
+
+
+def test_p1_call_never_starts_past_deadline(cvenv, clk):
+    calls, _st = cvenv
+    out, _ = cv._call(b"x", "p", 100, 4.5, cv.CallOpts(model="m-pd"), "t", deadline=clk["t"] + 0.5)
+    assert out is None and calls == []
+
+
+def _timed_ai(rn, clk, monkeypatch, read_s, verify_s=None, verify_over_s=0.0):
+    """Lectura y verificación falsas que consumen tiempo del reloj falso."""
+    seen = {"verify": [], "read": []}
+
+    def read(data, timeout_s=None, opts=None, deadline=None):
+        seen["read"].append((clk["t"], timeout_s, deadline))
+        clk["t"] += min(read_s, timeout_s) if read_s <= 8 else read_s  # >8: desborde real
+        return dict(rn["read"])
+
+    def verify(data, opts=None, timeout_s=None, deadline=None):
+        seen["verify"].append((clk["t"], timeout_s, deadline))
+        clk["t"] += (timeout_s if verify_s is None else min(verify_s, timeout_s)) + verify_over_s
+        r = rn["read"]
+        return {"fisico": True, "texto_leido": str(r.get("texto") or ""), "marca_leido": "",
+                "casting_leido": str(r.get("casting") or ""), "year_leido": r.get("year"), "detalle": "ok"}
+
+    monkeypatch.setattr(cv, "read_for_catalog", read)
+    monkeypatch.setattr(cv, "verify_real_object", verify)
+    return seen
+
+
+def test_p1_read_takes_all_budget_verify_skipped(rn, clk, monkeypatch):
+    seen = _timed_ai(rn, clk, monkeypatch, read_s=8.0)
+    _db.ai_catalog_usage.delete_many({})
+    _receipt()
+    assert _is_manual(_post().json())
+    t0, rt, dl = seen["read"][0]
+    assert rt == 8.0 and dl == t0 + 8.0
+    assert seen["verify"] == []  # quedaban 0 s (< 1.5): no inicia
+    assert _db.variants.count_documents({}) == 0
+    assert _db.ai_catalog_usage.find_one({"user_id": "u1"})["ai_calls"] == 1  # no reservó la 2ª
+    assert not _db.identify_receipts.find_one({}).get("ai_tried")
+
+
+def test_p1_verify_gets_what_is_left(rn, clk, monkeypatch):
+    seen = _timed_ai(rn, clk, monkeypatch, read_s=6.0)
+    _receipt()
+    assert _post().json()["method"] == "o"
+    t0 = seen["read"][0][0]
+    _vt, timeout, dl = seen["verify"][0]
+    assert timeout == pytest.approx(2.0) and dl == t0 + 8.0
+
+
+def test_p1_verify_not_started_under_1_5s(rn, clk, monkeypatch):
+    seen = _timed_ai(rn, clk, monkeypatch, read_s=6.6)
+    _receipt()
+    assert _is_manual(_post().json()) and seen["verify"] == []
+
+
+@pytest.mark.parametrize("read_s", [0.2, 3.0, 6.4, 6.5, 7.9, 8.0])
+def test_p1_worst_case_total_never_exceeds_13s(rn, clk, monkeypatch, read_s):
+    seen = _timed_ai(rn, clk, monkeypatch, read_s=read_s)  # verificación: todo su timeout
+    start = {}
+    real = idn._create_piece
+
+    async def timed_create(*a, **k):
+        start["t"] = clk["t"]
+        clk["t"] += 4.0  # el alta dura todo lo que se le garantiza
+        return await real(*a, **k)
+
+    monkeypatch.setattr(idn, "_create_piece", timed_create)
+    _receipt()
+    _post()
+    t0 = seen["read"][0][0]
+    if "t" in start:
+        assert start["t"] - t0 <= 13.0 - 4.0
+    assert clk["t"] - t0 <= 13.0
+
+
+def test_p1_no_time_to_create_is_manual_and_writes_nothing(rn, aienv, clk, monkeypatch):
+    # La verificación se pasa de su timeout (la red no respeta el reloj): sin 4 s, no se crea.
+    _timed_ai(rn, clk, monkeypatch, read_s=6.0, verify_over_s=3.0)
+    called = []
+    monkeypatch.setattr(aic, "prepare_image", lambda *a, **k: called.append(1))
+    _db.ai_catalog_usage.delete_many({})
+    _receipt()
+    assert _is_manual(_post().json())
+    assert called == [] and _db.variants.count_documents({}) == 0 and aienv["appends"] == []
+    assert not _db.ai_catalog_usage.find_one({"user_id": "u1"}).get("count")
+    assert _db.identify_receipts.find_one({})["ai_tried"] is True  # hubo lectura, como hoy
+
+
+def test_p1_budget_constants_defaults():
+    assert idn._RESOLVE_TOTAL_BUDGET_S == 13.0 and idn._RESOLVE_AI_BUDGET_S == 8.0
+    assert idn._RESOLVE_MIN_START_S == 1.5 and idn._RESOLVE_MIN_TIMEOUT_S == 1.0
+    assert idn._RESOLVE_CREATE_MIN_S == 4.0
+    assert cv._MAX_ATTEMPTS == 2 and cv._MIN_RETRY_S == 1.0
