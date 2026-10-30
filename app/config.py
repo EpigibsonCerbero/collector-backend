@@ -22,6 +22,15 @@ class Settings(BaseSettings):
     # Ids de usuario (coma) con permiso para editar el catálogo global.
     admin_user_ids: str = ""
 
+    # Premium / cuota de escaneos. La cuota nace apagada hasta que la app con
+    # el paywall esté en manos de los usuarios.
+    scan_limit_enabled: bool = False
+    premium_user_ids: str = ""  # ids (coma) con Premium forzado (pruebas/regalos)
+    free_daily_scans: int = 20
+    premium_grace_days: int = 3
+    revenuecat_secret_key: str = ""
+    revenuecat_webhook_auth: str = ""
+
     # Bootstrap admin (dev). Con la contraseña por defecto NO se crea y, si ya
     # existe con ella, se desactiva al arrancar (estaba publicada en el repo).
     seed_admin_email: str = "admin@collector.local"

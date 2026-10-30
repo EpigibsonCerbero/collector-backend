@@ -191,6 +191,13 @@ INDEXES: dict[str, list[tuple[list[tuple[str, int]], dict[str, Any]]]] = {
     "user_favorites": [
         ([("user_id", ASCENDING), ("kind", ASCENDING), ("event_id", ASCENDING)], {"unique": True}),
     ],
+    "subscriptions": [
+        ([("user_id", ASCENDING)], {"unique": True}),
+    ],
+    "scan_usage": [
+        ([("user_id", ASCENDING), ("day", ASCENDING)], {"unique": True}),
+        ([("created_at", ASCENDING)], {"expireAfterSeconds": 3 * 24 * 3600}),
+    ],
 }
 
 
